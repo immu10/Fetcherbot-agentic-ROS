@@ -1,0 +1,16 @@
+# Core: YOLO11 object detection
+# Pulls in torch, torchvision, numpy, pillow, pyyaml, etc. as deps.
+ultralytics>=8.3.0
+
+# Webcam / video I/O and frame display
+opencv-python>=4.8.0
+
+# Pinning numpy < 2 avoids occasional ABI mismatches with older torch builds.
+# Remove this cap once everything in the stack is numpy 2.x clean.
+numpy<2.0
+
+# Speech-to-text: CTranslate2 reimpl of Whisper (~4x faster, half the RAM).
+faster-whisper>=1.0.0
+
+# Microphone capture (PortAudio bindings) for the live STT mic path.
+sounddevice>=0.4.6
