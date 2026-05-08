@@ -11,8 +11,6 @@ Switch sims by writing a sibling file (e.g. unity.launch.py) — agent.launch.py
 stays untouched.
 
 Launch arguments:
-  world     : .world file path passed through to the TB3 bringup (default: empty).
-  headless  : 'true' to run Gazebo without the GUI client (default: false).
   spawn_objects : 'false' to skip the test-object spawns (default: true).
 """
 
@@ -30,14 +28,13 @@ from launch_ros.substitutions import FindPackageShare
 
 
 # -----------------------------------------------------------------------------
-# ASSUMPTION: ROS 2 Humble + the upstream `turtlebot3_manipulation_bringup`
-# package, which ships a `gazebo.launch.py` that spawns the Waffle-Pi base +
-# OpenManipulator-X arm and starts ros2_control. If your distro/fork uses a
-# different package (e.g. `turtlebot3_manipulation_simulations` on Foxy, or
-# `turtlebot3_manipulation_gazebo` in some forks), change TB3_SIM_PACKAGE below.
+# ROS 2 Humble apt build of TB3 Manipulation: the canonical sim launch lives in
+# the moveit_config package, not bringup. moveit_gazebo.launch.py spins up
+# Gazebo, spawns the Waffle-Pi base + OpenManipulator-X arm with ros2_control,
+# AND starts MoveIt2 in one shot — so we don't need a separate MoveIt include.
 # -----------------------------------------------------------------------------
-TB3_SIM_PACKAGE = "turtlebot3_manipulation_bringup"
-TB3_SIM_LAUNCH  = "gazebo.launch.py"
+TB3_SIM_PACKAGE = "turtlebot3_manipulation_moveit_config"
+TB3_SIM_LAUNCH  = "moveit_gazebo.launch.py"
 
 
 # ---------- inline SDF for the test objects ----------
@@ -127,23 +124,18 @@ def _spawn(name: str, sdf_xml: str, x: float, y: float, z: float):
 
 
 def generate_launch_description():
-    world     = LaunchConfiguration("world")
-    headless  = LaunchConfiguration("headless")
     do_spawn  = LaunchConfiguration("spawn_objects")
 
-    # 1) Gazebo + the robot. Forward our launch args through to the upstream
-    #    bringup. Argument names below match the upstream TB3 manipulation
-    #    convention; if your fork uses different ones, tweak here.
+    # 1) Gazebo + the robot + MoveIt2 (all from the upstream launch).
+    #    No launch_arguments forwarded: moveit_gazebo.launch.py doesn't declare
+    #    `world` or `headless`, and forwarding undeclared args is a hard error.
+    #    Add args here only after confirming the upstream launch declares them.
     sim_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare(TB3_SIM_PACKAGE), "launch", TB3_SIM_LAUNCH,
             ])
         ),
-        launch_arguments={
-            "world":    world,
-            "headless": headless,
-        }.items(),
     )
 
     # 2) Test objects, sized for the OpenManipulator-X gripper (~2cm jaw width).
@@ -186,10 +178,6 @@ def generate_launch_description():
     delayed_agent = TimerAction(period=10.0, actions=[agent_launch])
 
     return LaunchDescription([
-        DeclareLaunchArgument("world",         default_value="",
-                              description="Optional .world file passed to the TB3 sim bringup."),
-        DeclareLaunchArgument("headless",      default_value="false",
-                              description="Set 'true' to run Gazebo without the GUI client."),
         DeclareLaunchArgument("spawn_objects", default_value="true",
                               description="Set 'false' to skip the test-object spawns."),
 
