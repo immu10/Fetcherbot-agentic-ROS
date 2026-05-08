@@ -14,3 +14,7 @@ faster-whisper>=1.0.0
 
 # Microphone capture (PortAudio bindings) for the live STT mic path.
 sounddevice>=0.4.6
+
+# LLM agent: Groq tool-calling loop.
+groq>=0.11.0
+python-dotenv>=1.0.0
