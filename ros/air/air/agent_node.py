@@ -32,6 +32,8 @@ from typing import Optional
 import numpy as np
 
 import rclpy
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -39,8 +41,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
 from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
+from tf2_ros import Buffer, TransformListener
 
 # Import the standalone YOLO loader from the project's OD module so we don't
 # duplicate model config. OD.py lives at the repo root, which is several dirs
@@ -213,9 +217,18 @@ class AgentNode(Node):
         self._answer_lock  = threading.Lock()
         self._latest_answer: Optional[str] = None
 
-        # ---- nav goal handle (filled in once navigate_to is implemented) ----
-        # Keeping it here means check_nav_status() is already wired to read it
-        # and report a meaningful status the day navigate_to lands.
+        # ---- tf2 buffer (used by ground-plane projection in scan_scene) ----
+        # The TransformListener subscribes to /tf and /tf_static via this node's
+        # executor; lookups in scan_scene/navigate_to are pure reads against
+        # the buffer.
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # ---- Nav2 action client + nav goal state ----
+        # Server name matches the default in turtlebot3_manipulation_navigation2.
+        # check_nav_status() reads _nav_goal_handle / _nav_last_status —
+        # navigate_to() fills them in.
+        self._nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self._nav_goal_handle = None
         self._nav_last_status: Optional[int] = None  # last terminal GoalStatus.
 
@@ -272,23 +285,23 @@ class AgentNode(Node):
     # ---- tool methods (called from tools.py) ----
 
     def scan_scene(self) -> dict:
-        """Run YOLO on the latest RGB frame; back-project each detection's
-        center pixel through the depth image to get a 3D point in the camera's
-        optical frame.
+        """Run YOLO on the latest RGB frame; project each detection's center
+        pixel onto the floor (z=0) in `map` frame via tf2 — gives the LLM real
+        navigable coordinates without needing a depth camera.
 
         Returns:
-            {"detections": [{"label", "confidence", "position": {x,y,z},
-                             "bbox": [x1,y1,x2,y2], "frame_id": str}, ...]}
-            or {"error": "..."} on failure.
+            {"detections": [{"label", "confidence", "position": {x,y,z=0},
+                             "bbox": [x1,y1,x2,y2], "frame_id": "map"}, ...]}
+            or {"error": "..."} on failure. position is None if tf or camera
+            intrinsics aren't ready yet (the LLM should retry or ask the user).
         """
         if self._yolo is None:
             return {"error": "YOLO model not loaded (see node startup logs)."}
 
         with self._frame_lock:
             rgb = None if self._latest_rgb is None else self._latest_rgb.copy()
-            depth = None if self._latest_depth is None else self._latest_depth.copy()
             cam_model = self._cam_model
-            frame_id = self._cam_frame_id
+            cam_frame = self._cam_frame_id
 
         if rgb is None:
             return {"error": f"no RGB frame received yet on {RGB_TOPIC}."}
@@ -310,20 +323,19 @@ class AgentNode(Node):
         confs = boxes.conf.cpu().numpy()
         clss  = boxes.cls.cpu().numpy().astype(int)
 
-        h, w = rgb.shape[:2]
         for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
             label = names.get(int(cls_id), str(cls_id)) if isinstance(names, dict) else names[int(cls_id)]
 
-            position = self._pixel_to_camera_xyz(cx, cy, depth, cam_model, w, h)
+            position = self._project_to_ground(cx, cy, cam_model, cam_frame, "map")
 
             detections.append({
                 "label": label,
                 "confidence": float(conf),
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "position": position,            # in camera optical frame, or None
-                "frame_id": frame_id,
+                "position": position,            # {x,y,z=0} in map frame, or None
+                "frame_id": "map",
             })
 
         return {"detections": detections}
@@ -359,8 +371,112 @@ class AgentNode(Node):
         y = ray[1] / rz * z
         return {"x": float(x), "y": float(y), "z": float(z)}
 
+    @staticmethod
+    def _quat_rotate(q, v):
+        """Rotate 3-vec v by quaternion q=(x,y,z,w). Pure-Python, no scipy.
+
+        Uses the standard t = 2 * (q.xyz × v); v' = v + qw*t + q.xyz × t form
+        — equivalent to q * v * q^-1 for unit quaternions, ~6× faster than
+        building a rotation matrix when we only rotate one vector.
+        """
+        qx, qy, qz, qw = q
+        vx, vy, vz = v
+        tx = 2.0 * (qy * vz - qz * vy)
+        ty = 2.0 * (qz * vx - qx * vz)
+        tz = 2.0 * (qx * vy - qy * vx)
+        rx = vx + qw * tx + (qy * tz - qz * ty)
+        ry = vy + qw * ty + (qz * tx - qx * tz)
+        rz = vz + qw * tz + (qx * ty - qy * tx)
+        return (rx, ry, rz)
+
+    def _project_to_ground(
+        self,
+        u: int,
+        v: int,
+        cam_model: Optional[PinholeCameraModel],
+        cam_frame: str,
+        target_frame: str = "map",
+    ) -> Optional[dict]:
+        """Back-project pixel (u,v) and intersect the resulting ray with z=0
+        in `target_frame`. Returns {"x","y","z":0} or None if intrinsics or
+        the tf chain aren't ready yet.
+
+        Floor-only assumption: the object is at z=0 in target_frame. Tall
+        objects on tables will project further out (the ray keeps going past
+        them until it hits the ground). For our floor-bot, fine.
+        """
+        if cam_model is None:
+            return None
+        try:
+            t = self._tf_buffer.lookup_transform(
+                target_frame, cam_frame,
+                rclpy.time.Time(),                    # latest available
+                timeout=Duration(seconds=0.5),
+            )
+        except Exception as e:
+            self.get_logger().debug(f"tf lookup {target_frame}<-{cam_frame} failed: {e}")
+            return None
+
+        # Camera origin in target_frame.
+        ox = t.transform.translation.x
+        oy = t.transform.translation.y
+        oz = t.transform.translation.z
+
+        # Pixel → unit ray in CAMERA optical frame, then rotate into target.
+        rcx, rcy, rcz = cam_model.projectPixelTo3dRay((u, v))
+        q = (
+            t.transform.rotation.x, t.transform.rotation.y,
+            t.transform.rotation.z, t.transform.rotation.w,
+        )
+        rx, ry, rz = self._quat_rotate(q, (rcx, rcy, rcz))
+
+        # Ray-plane intersection: ox + s*rx, oy + s*ry, oz + s*rz; solve for z=0.
+        if abs(rz) < 1e-6:
+            return None  # ray parallel to ground
+        s = -oz / rz
+        if s <= 0:
+            return None  # ray points away from / above ground
+        return {"x": float(ox + s * rx), "y": float(oy + s * ry), "z": 0.0}
+
     def navigate_to(self, x: float, y: float) -> dict:
-        raise NotImplementedError("navigate_to: wire to Nav2 NavigateToPose action.")
+        """Send a NavigateToPose goal in `map` frame; return immediately.
+
+        The LLM polls completion via check_nav_status() — this method only
+        confirms the goal was accepted (status='active'), or returns a
+        descriptive failure if Nav2 isn't up / rejected the goal.
+
+        Orientation is identity (face +X). Future enhancement: face the goal
+        by reading current robot pose from tf and computing yaw.
+        """
+        if not self._nav_client.wait_for_server(timeout_sec=2.0):
+            return {"status": "failed", "reason": "Nav2 action server unavailable"}
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = "map"
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.position.z = 0.0
+        goal.pose.pose.orientation.w = 1.0  # identity quaternion
+
+        send_future = self._nav_client.send_goal_async(goal)
+
+        # The executor thread is already spinning; just wait on the future.
+        deadline = time.time() + 5.0
+        while not send_future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not send_future.done():
+            return {"status": "failed", "reason": "send_goal timed out (Nav2 didn't acknowledge)"}
+
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return {"status": "failed", "reason": "Nav2 rejected goal"}
+
+        # Stash for check_nav_status() to read.
+        self._nav_goal_handle = goal_handle
+        self._nav_last_status = None
+        self.get_logger().info(f"navigate_to: goal accepted target=({x:.2f}, {y:.2f})")
+        return {"status": "active", "target": {"x": float(x), "y": float(y)}}
 
     def check_nav_status(self) -> dict:
         """Map the current Nav2 goal state to a coarse status string for the LLM.

@@ -1,11 +1,15 @@
-"""ros2 launch air gazebo.launch.py — Gazebo + TB3 Manipulation + test objects + agent.
+"""ros2 launch air gazebo.launch.py — Gazebo + TB3 Manipulation + SLAM + Nav2 + agent.
 
 Flow:
   1. Bring up Gazebo with the TurtleBot3 Manipulation robot already in it
      (delegated to the upstream `turtlebot3_manipulation_bringup` launch).
   2. Wait a few seconds for Gazebo + ros2_control + the robot to settle.
   3. Spawn a few graspable test objects in front of the robot.
-  4. Include agent.launch.py to start agent_node.
+  4. Start slam_toolbox (online_async, mapping mode) — publishes /map and tf
+     chain map→odom→base_footprint that ground-plane projection + Nav2 need.
+  5. Start Nav2 (turtlebot3_manipulation_navigation2) — exposes the
+     /navigate_to_pose action server agent_node will hit.
+  6. Include agent.launch.py to start agent_node.
 
 Switch sims by writing a sibling file (e.g. unity.launch.py) — agent.launch.py
 stays untouched.
@@ -100,7 +104,36 @@ def generate_launch_description():
         condition=IfCondition(do_spawn),
     )
 
-    # 3) Our agent_node. Pulled from the existing launch file so we don't
+    # 3) SLAM — slam_toolbox in mapping mode (online async). Publishes /map and
+    #    the map→odom→base_footprint tf chain that Nav2 + ground-plane
+    #    projection both consume. To switch to a saved-map workflow later,
+    #    swap online_async_launch.py for localization_launch.py and pass
+    #    `slam_params_file:=...` pointing at a saved posegraph.
+    slam_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("slam_toolbox"), "launch", "online_async_launch.py",
+            ])
+        ),
+        launch_arguments={"use_sim_time": "true"}.items(),
+    )
+    delayed_slam = TimerAction(period=6.0, actions=[slam_launch])
+
+    # 4) Nav2 — uses the sim-time variant so it matches gzserver's clock.
+    #    Exposes /navigate_to_pose (NavigateToPose action) which agent_node's
+    #    navigate_to() calls. Comes up later than SLAM so the costmap has a
+    #    /map topic to subscribe to immediately.
+    nav2_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("turtlebot3_manipulation_navigation2"),
+                "launch", "navigation2_use_sim_time.launch.py",
+            ])
+        ),
+    )
+    delayed_nav2 = TimerAction(period=8.0, actions=[nav2_launch])
+
+    # 5) Our agent_node. Pulled from the existing launch file so we don't
     #    duplicate its parameters here — single source of truth.
     agent_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -110,8 +143,9 @@ def generate_launch_description():
         )
     )
     # Same race concern as the object spawns: the YOLO model load is slow and
-    # camera topics aren't published until Gazebo is ready. Delay slightly.
-    delayed_agent = TimerAction(period=10.0, actions=[agent_launch])
+    # camera topics aren't published until Gazebo is ready. Delay enough that
+    # SLAM and Nav2 are also up by the time agent_node first scans / navigates.
+    delayed_agent = TimerAction(period=12.0, actions=[agent_launch])
 
     return LaunchDescription([
         DeclareLaunchArgument("spawn_objects", default_value="true",
@@ -119,5 +153,7 @@ def generate_launch_description():
 
         sim_launch,
         delayed_spawns,
+        delayed_slam,
+        delayed_nav2,
         delayed_agent,
     ])
