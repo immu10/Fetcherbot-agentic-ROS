@@ -9,12 +9,15 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}/launch", ["launch/agent.launch.py"]),
+        (f"share/{package_name}/launch", [
+            "launch/agent.launch.py",
+            "launch/gazebo.launch.py",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="immu10",
-    maintainer_email="lori.roli55@gmail.com",
+    maintainer_email="s.s.immanuel149@gmail.com",
     description="LLM agent ROS2 wrapper.",
     license="MIT",
     entry_points={

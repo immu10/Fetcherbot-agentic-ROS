@@ -1,58 +1,351 @@
 """
 ROS2 wrapper for the agent tools.
 
-One rclpy node owns the YOLO model, action clients, subscribers, and TF buffer.
-tools.py calls into the singleton via `get_node()`. rclpy spins on a background
-thread so the synchronous agent loop can block on `future.result()`.
+One rclpy node owns the YOLO model, camera subscriptions, and (eventually)
+action clients + TF buffer. tools.py calls into the singleton via `get_node()`.
+rclpy spins on a background thread so the synchronous agent loop can block on
+`future.result()` without deadlocking the executor.
+
+Currently implemented:
+    - scan_scene()  → live YOLO11 detection on the Gazebo RGB camera, with
+                      center-pixel depth → 3D point in the camera's optical
+                      frame.
+
+Stubs (raise NotImplementedError until wired to Nav2 / MoveIt2):
+    - navigate_to(x, y)
+    - check_nav_status()
+    - pick_up(object_label)
+    - ask_user(question)
 """
 
 from __future__ import annotations
 
+import math
+import os
+import sys
 import threading
+from typing import Optional
 
-# import rclpy
-# from rclpy.node import Node
-# from rclpy.executors import MultiThreadedExecutor
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
+from action_msgs.msg import GoalStatus
+from cv_bridge import CvBridge
+from image_geometry import PinholeCameraModel
+
+# Import the standalone YOLO loader from the project's OD module so we don't
+# duplicate model config. OD.py lives at the repo root — make sure it's on
+# PYTHONPATH (e.g. export PYTHONPATH=$PYTHONPATH:~/airbs before ros2 run).
+try:
+    import OD  # type: ignore
+except ImportError:
+    OD = None  # YOLO disabled; scan_scene will surface a clear error.
 
 
-_node_singleton = None
+# ---------- topic configuration ----------
+# Defaults match the TurtleBot3 + Gazebo plugin convention. Override via env
+# vars if your sim publishes elsewhere (e.g. /camera/rgb/image_raw).
+RGB_TOPIC        = os.environ.get("AIR_RGB_TOPIC",        "/camera/image_raw")
+DEPTH_TOPIC      = os.environ.get("AIR_DEPTH_TOPIC",      "/camera/depth/image_raw")
+CAMERA_INFO_TOPIC = os.environ.get("AIR_CAMERA_INFO_TOPIC", "/camera/camera_info")
+
+
+_node_singleton: Optional["AgentNode"] = None
 _lock = threading.Lock()
 
 
-class AgentNode:  # (Node):
+class AgentNode(Node):
     """Owns all robot I/O. One instance per process."""
 
     def __init__(self):
-        # rclpy.init() if not already
-        # super().__init__("agent_node")
-        # action clients: NavigateToPose, MoveGroup, GripperCommand
-        # subscribers: /camera/image_raw, /camera/depth/image_raw, /camera/camera_info, /agent/answer
-        # publishers:  /agent/question
-        # TF buffer + listener
-        # YOLO model load (OD.load_model)
-        # MultiThreadedExecutor on a daemon thread
-        raise NotImplementedError
+        super().__init__("agent_node")
+
+        # Tunable parameters (also set in agent.launch.py). rclpy needs
+        # explicit declaration before values from the launch file take effect.
+        self.declare_parameter("nav_timeout_s",     60.0)
+        self.declare_parameter("pick_timeout_s",    30.0)
+        self.declare_parameter("ask_timeout_s",     60.0)
+        self.declare_parameter("scan_cache_ttl_s",   2.0)
+        self.declare_parameter("yolo_model_path",   "yolo11s.pt")
+        self.declare_parameter("yolo_conf",          0.35)
+
+        # Sensor data + cv_bridge live behind a lock so scan_scene() (called
+        # from the agent thread) and the subscription callbacks (executor
+        # thread) don't race.
+        self._bridge = CvBridge()
+        self._frame_lock = threading.Lock()
+        self._latest_rgb: Optional[np.ndarray] = None      # HxWx3 BGR
+        self._latest_depth: Optional[np.ndarray] = None    # HxW float32 (meters)
+        self._cam_model: Optional[PinholeCameraModel] = None
+        self._cam_frame_id: str = "camera_link"
+
+        # YOLO model — load once, reuse on every scan. Skipped if OD couldn't
+        # be imported so the node still boots and can be poked over topics.
+        self._yolo = None
+        if OD is not None:
+            try:
+                self.get_logger().info("loading YOLO model (this can take a few seconds)...")
+                self._yolo = OD.load_model()
+                self.get_logger().info("YOLO model ready.")
+            except Exception as e:
+                self.get_logger().error(f"YOLO load failed: {e}")
+        else:
+            self.get_logger().warn(
+                "OD module not importable — scan_scene() will return an error. "
+                "Add the repo root to PYTHONPATH (e.g. export PYTHONPATH=$PYTHONPATH:~/airbs)."
+            )
+
+        # Sensor data is high-volume; BEST_EFFORT keeps us from backing up
+        # publishers. Camera plugins in Gazebo publish best-effort by default.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self.create_subscription(Image,       RGB_TOPIC,         self._on_rgb,        sensor_qos)
+        self.create_subscription(Image,       DEPTH_TOPIC,       self._on_depth,      sensor_qos)
+        self.create_subscription(CameraInfo,  CAMERA_INFO_TOPIC, self._on_camera_info, sensor_qos)
+
+        self.get_logger().info(
+            f"subscribed: rgb={RGB_TOPIC}  depth={DEPTH_TOPIC}  info={CAMERA_INFO_TOPIC}"
+        )
+
+        # ---- ask_user: question/answer over std_msgs/String ----
+        # Publisher fires the question, the UI (or another node, or a
+        # `ros2 topic pub` from a human) replies on /agent/answer. We block
+        # the calling tool thread on _answer_event until the answer arrives
+        # or ask_timeout_s elapses.
+        self._question_pub = self.create_publisher(String, "/agent/question", 10)
+        self.create_subscription(String, "/agent/answer", self._on_answer, 10)
+        self._answer_event = threading.Event()
+        self._answer_lock  = threading.Lock()
+        self._latest_answer: Optional[str] = None
+
+        # ---- nav goal handle (filled in once navigate_to is implemented) ----
+        # Keeping it here means check_nav_status() is already wired to read it
+        # and report a meaningful status the day navigate_to lands.
+        self._nav_goal_handle = None
+        self._nav_last_status: Optional[int] = None  # last terminal GoalStatus.
+
+        # Spin on a background thread so synchronous tool calls work.
+        self._executor = MultiThreadedExecutor()
+        self._executor.add_node(self)
+        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._spin_thread.start()
+
+    # ---- subscription callbacks ----
+
+    def _on_rgb(self, msg: Image):
+        try:
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().warn(f"rgb convert failed: {e}")
+            return
+        with self._frame_lock:
+            self._latest_rgb = frame
+
+    def _on_depth(self, msg: Image):
+        # Gazebo's depth camera plugin typically publishes 32FC1 in meters.
+        # If your sim uses 16UC1 (mm), the divide-by-1000 below converts it.
+        try:
+            depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception as e:
+            self.get_logger().warn(f"depth convert failed: {e}")
+            return
+        if depth.dtype == np.uint16:
+            depth = depth.astype(np.float32) / 1000.0
+        elif depth.dtype != np.float32:
+            depth = depth.astype(np.float32)
+        with self._frame_lock:
+            self._latest_depth = depth
+
+    def _on_answer(self, msg: String):
+        """User reply on /agent/answer. Stash it and wake whoever's waiting."""
+        with self._answer_lock:
+            self._latest_answer = msg.data
+        self._answer_event.set()
+
+    def _on_camera_info(self, msg: CameraInfo):
+        # Build the pinhole model once; intrinsics rarely change at runtime.
+        if self._cam_model is None:
+            model = PinholeCameraModel()
+            model.fromCameraInfo(msg)
+            with self._frame_lock:
+                self._cam_model = model
+                self._cam_frame_id = msg.header.frame_id or self._cam_frame_id
+            self.get_logger().info(
+                f"camera intrinsics received (frame_id={self._cam_frame_id})."
+            )
 
     # ---- tool methods (called from tools.py) ----
 
     def scan_scene(self) -> dict:
-        raise NotImplementedError
+        """Run YOLO on the latest RGB frame; back-project each detection's
+        center pixel through the depth image to get a 3D point in the camera's
+        optical frame.
+
+        Returns:
+            {"detections": [{"label", "confidence", "position": {x,y,z},
+                             "bbox": [x1,y1,x2,y2], "frame_id": str}, ...]}
+            or {"error": "..."} on failure.
+        """
+        if self._yolo is None:
+            return {"error": "YOLO model not loaded (see node startup logs)."}
+
+        with self._frame_lock:
+            rgb = None if self._latest_rgb is None else self._latest_rgb.copy()
+            depth = None if self._latest_depth is None else self._latest_depth.copy()
+            cam_model = self._cam_model
+            frame_id = self._cam_frame_id
+
+        if rgb is None:
+            return {"error": f"no RGB frame received yet on {RGB_TOPIC}."}
+
+        try:
+            result, _ = OD.detect_frame(self._yolo, rgb)
+        except Exception as e:
+            return {"error": f"YOLO inference failed: {type(e).__name__}: {e}"}
+
+        names = result.names  # class_id -> label
+        detections = []
+
+        # ultralytics Results — boxes is None when nothing detected.
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return {"detections": []}
+
+        xyxy  = boxes.xyxy.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        clss  = boxes.cls.cpu().numpy().astype(int)
+
+        h, w = rgb.shape[:2]
+        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            label = names.get(int(cls_id), str(cls_id)) if isinstance(names, dict) else names[int(cls_id)]
+
+            position = self._pixel_to_camera_xyz(cx, cy, depth, cam_model, w, h)
+
+            detections.append({
+                "label": label,
+                "confidence": float(conf),
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "position": position,            # in camera optical frame, or None
+                "frame_id": frame_id,
+            })
+
+        return {"detections": detections}
+
+    def _pixel_to_camera_xyz(
+        self,
+        u: int,
+        v: int,
+        depth: Optional[np.ndarray],
+        cam_model: Optional[PinholeCameraModel],
+        w: int,
+        h: int,
+    ) -> Optional[dict]:
+        """Back-project pixel (u,v) to a 3D point in the camera optical frame.
+        Returns None if depth or intrinsics are missing / invalid at that pixel.
+        TODO: tf2 transform into map / base_link for Nav2 / MoveIt2 consumers.
+        """
+        if depth is None or cam_model is None:
+            return None
+        if not (0 <= u < depth.shape[1] and 0 <= v < depth.shape[0]):
+            return None
+
+        z = float(depth[v, u])
+        if not math.isfinite(z) or z <= 0.0:
+            return None
+
+        # PinholeCameraModel.projectPixelTo3dRay returns a unit ray (X,Y,1-ish);
+        # multiply by z to land on the surface.
+        ray = cam_model.projectPixelTo3dRay((u, v))
+        # Normalise so ray.z == 1, then scale by depth.
+        rz = ray[2] if ray[2] != 0 else 1.0
+        x = ray[0] / rz * z
+        y = ray[1] / rz * z
+        return {"x": float(x), "y": float(y), "z": float(z)}
 
     def navigate_to(self, x: float, y: float) -> dict:
-        raise NotImplementedError
+        raise NotImplementedError("navigate_to: wire to Nav2 NavigateToPose action.")
 
     def check_nav_status(self) -> dict:
-        raise NotImplementedError
+        """Map the current Nav2 goal state to a coarse status string for the LLM.
+
+        States returned: idle | active | succeeded | failed | canceled.
+        Until navigate_to is implemented, _nav_goal_handle stays None and we
+        report 'idle' (or the last terminal status if a goal already finished).
+        """
+        gh = self._nav_goal_handle
+        if gh is not None:
+            # Active goal: query its current status.
+            status = gh.status
+            if status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING):
+                return {"status": "active"}
+            # Goal finished — clear the handle so future calls report from the
+            # cached terminal status instead of re-reading a stale handle.
+            self._nav_last_status = status
+            self._nav_goal_handle = None
+
+        last = self._nav_last_status
+        if last is None:
+            return {"status": "idle"}
+        if last == GoalStatus.STATUS_SUCCEEDED:
+            return {"status": "succeeded"}
+        if last == GoalStatus.STATUS_CANCELED:
+            return {"status": "canceled"}
+        # Aborted, unknown, or anything else terminal → failed.
+        return {"status": "failed"}
 
     def pick_up(self, object_label: str) -> dict:
-        raise NotImplementedError
+        raise NotImplementedError("pick_up: wire to MoveIt2 MoveGroup + GripperCommand.")
 
     def ask_user(self, question: str) -> dict:
-        raise NotImplementedError
+        """Publish a question, block until /agent/answer comes back (or timeout).
+
+        Returns:
+            {"answer": "<user reply>"}  on success
+            {"error": "timeout after Xs"} if no reply within ask_timeout_s
+        """
+        timeout = float(self.get_parameter("ask_timeout_s").value)
+
+        # Reset state under the lock so a stale answer from a previous call
+        # can't satisfy this one.
+        with self._answer_lock:
+            self._latest_answer = None
+            self._answer_event.clear()
+
+        msg = String()
+        msg.data = question
+        self._question_pub.publish(msg)
+        self.get_logger().info(f"asked user: {question!r}  (timeout {timeout}s)")
+
+        if not self._answer_event.wait(timeout=timeout):
+            return {"error": f"timeout after {timeout}s waiting for /agent/answer"}
+
+        with self._answer_lock:
+            answer = self._latest_answer or ""
+        return {"answer": answer}
 
     def shutdown(self):
-        # cancel goals, executor.shutdown(), rclpy.shutdown()
-        raise NotImplementedError
+        try:
+            self._executor.shutdown()
+        except Exception:
+            pass
+        try:
+            self.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def get_node() -> AgentNode:
@@ -60,6 +353,8 @@ def get_node() -> AgentNode:
     global _node_singleton
     with _lock:
         if _node_singleton is None:
+            if not rclpy.ok():
+                rclpy.init(args=sys.argv)
             _node_singleton = AgentNode()
         return _node_singleton
 
@@ -73,9 +368,17 @@ def shutdown_node():
 
 
 def main():
-    """Entry point for `ros2 run air agent_node` and the launch file."""
-    get_node()
+    """Entry point for `ros2 run air agent_node` and the launch file.
+
+    For now this just brings the node up (camera subs + YOLO) and idles. Drive
+    scan_scene() from another process via the agent loop, or import
+    `air.agent_node.get_node().scan_scene()` from a Python REPL.
+    """
+    node = get_node()
+    node.get_logger().info("agent_node up. Ctrl-C to exit.")
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
+        pass
+    finally:
         shutdown_node()

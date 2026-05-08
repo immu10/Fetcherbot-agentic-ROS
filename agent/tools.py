@@ -15,9 +15,9 @@ import os
 
 
 # ---------- mode switch ----------
-# Set TEST_RUN=1 to use offline stubs instead of the ROS node — useful on
-# Windows / before colcon build. Anything else → real ROS calls.
-TEST_RUN = os.environ.get("TEST_RUN") == "1"
+# Default: real ROS calls (camera, Nav2, MoveIt2). Set IS_TEST_RUN=1 to fall
+# back to offline stubs — useful on Windows / before `colcon build`.
+IS_TEST_RUN = os.environ.get("IS_TEST_RUN") == "1"
 
 
 # ---------- tool implementations ----------
@@ -37,13 +37,13 @@ _FAKE_SCENE = {
 
 
 def scan_scene() -> dict:
-    if TEST_RUN:
+    if IS_TEST_RUN:
         return _FAKE_SCENE
     return _node().scan_scene()
 
 
 def navigate_to(x: float, y: float) -> dict:
-    if TEST_RUN:
+    if IS_TEST_RUN:
         # Pretend (1.2, 0.4) is blocked so the agent has to replan.
         if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
             return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
@@ -52,19 +52,19 @@ def navigate_to(x: float, y: float) -> dict:
 
 
 def check_nav_status() -> dict:
-    if TEST_RUN:
+    if IS_TEST_RUN:
         return {"status": "idle"}
     return _node().check_nav_status()
 
 
 def pick_up(object_label: str) -> dict:
-    if TEST_RUN:
+    if IS_TEST_RUN:
         return {"status": "success", "object": object_label}
     return _node().pick_up(object_label)
 
 
 def ask_user(question: str) -> dict:
-    if TEST_RUN:
+    if IS_TEST_RUN:
         print(f"\n[agent asks] {question}")
         return {"answer": input("you: ").strip()}
     return _node().ask_user(question)
@@ -72,7 +72,7 @@ def ask_user(question: str) -> dict:
 
 def release():
     """Shut down the ROS node / executor. Called once at agent exit."""
-    if TEST_RUN:
+    if IS_TEST_RUN:
         return
     from air.agent_node import shutdown_node
     shutdown_node()
