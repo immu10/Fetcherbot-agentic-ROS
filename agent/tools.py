@@ -1,68 +1,52 @@
 """
-Agent tools — isolated test stubs.
+Agent tools — thin façade the LLM tool-use loop calls into.
 
-These are pure-Python stubs so the LLM tool-use loop can be exercised
-without a webcam, ROS, Nav2, or MoveIt2. Each stub returns plausible JSON
-that matches the shape the real ROS wrapper will eventually produce.
+All robot I/O lives in agent/ros/agent_node.py. These functions just forward
+to the singleton node. tools.py itself stays pure Python (no rclpy at import
+time) so the agent loop can be unit-tested with a mocked DISPATCH.
 
-When this gets wrapped as a ROS2 node:
-  - `scan_scene` will subscribe to /camera/image_raw, run YOLO (OD.py's
-    `detect_frame`) on the latest frame, and pass detections through the
-    localizer for real 3D positions.
-  - `navigate_to` / `check_nav_status` will call Nav2 actions.
-  - `pick_up` will call MoveIt2.
-  - `ask_user` will publish to a UI topic and await a reply.
-
-`TOOLS` is the schema list passed to the Claude API.
+`TOOLS` is the schema list passed to the LLM.
 `DISPATCH` maps tool name → callable for the agent loop.
 """
 
 from __future__ import annotations
 
-# ---------- fake world state for testing ----------
 
-_FAKE_SCENE = {
-    "detections": [
-        {"label": "pen",    "confidence": 0.91, "position": {"x": 1.2, "y": 0.4, "z": 0.01}},
-        {"label": "eraser", "confidence": 0.87, "position": {"x": 0.8, "y": 0.6, "z": 0.01}},
-    ]
-}
+# ---------- tool implementations (forward to ROS node) ----------
 
+def _node():
+    # Available after `colcon build` + `source install/setup.bash` on Linux.
+    from air.agent_node import get_node
+    return get_node()
 
-# ---------- tool implementations (stubs) ----------
 
 def scan_scene() -> dict:
-    """Return a canned detection list. Real impl runs YOLO on /camera/image_raw."""
-    return _FAKE_SCENE
+    return _node().scan_scene()
 
 
 def navigate_to(x: float, y: float) -> dict:
-    # Pretend the path at (1.1, 0.3) is blocked so the agent has to replan.
-    if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
-        return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
-    return {"status": "success", "reason": f"arrived at ({x}, {y})"}
+    return _node().navigate_to(x, y)
 
 
 def check_nav_status() -> dict:
-    return {"status": "idle"}
+    return _node().check_nav_status()
 
 
 def pick_up(object_label: str) -> dict:
-    return {"status": "success", "object": object_label}
+    return _node().pick_up(object_label)
 
 
 def ask_user(question: str) -> dict:
-    print(f"\n[agent asks] {question}")
-    answer = input("you: ").strip()
-    return {"answer": answer}
+    return _node().ask_user(question)
 
 
 def release():
-    """No-op for the stub build; kept so agent.py can call it unconditionally."""
-    return None
+    """Shut down the ROS node / executor. Called once at agent exit."""
+    from air.agent_node import shutdown_node
+    shutdown_node()
 
 
-# ---------- Tools schema ----------
+# ---------- LLM tools schema ----------
 
 TOOLS = [
     {
