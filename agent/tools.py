@@ -11,8 +11,16 @@ time) so the agent loop can be unit-tested with a mocked DISPATCH.
 
 from __future__ import annotations
 
+import os
 
-# ---------- tool implementations (forward to ROS node) ----------
+
+# ---------- mode switch ----------
+# Set TEST_RUN=1 to use offline stubs instead of the ROS node — useful on
+# Windows / before colcon build. Anything else → real ROS calls.
+TEST_RUN = os.environ.get("TEST_RUN") == "1"
+
+
+# ---------- tool implementations ----------
 
 def _node():
     # Available after `colcon build` + `source install/setup.bash` on Linux.
@@ -20,28 +28,52 @@ def _node():
     return get_node()
 
 
+_FAKE_SCENE = {
+    "detections": [
+        {"label": "pen",    "confidence": 0.91, "position": {"x": 1.2, "y": 0.4, "z": 0.01}},
+        {"label": "eraser", "confidence": 0.87, "position": {"x": 0.8, "y": 0.6, "z": 0.01}},
+    ]
+}
+
+
 def scan_scene() -> dict:
+    if TEST_RUN:
+        return _FAKE_SCENE
     return _node().scan_scene()
 
 
 def navigate_to(x: float, y: float) -> dict:
+    if TEST_RUN:
+        # Pretend (1.2, 0.4) is blocked so the agent has to replan.
+        if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
+            return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
+        return {"status": "success", "reason": f"arrived at ({x}, {y})"}
     return _node().navigate_to(x, y)
 
 
 def check_nav_status() -> dict:
+    if TEST_RUN:
+        return {"status": "idle"}
     return _node().check_nav_status()
 
 
 def pick_up(object_label: str) -> dict:
+    if TEST_RUN:
+        return {"status": "success", "object": object_label}
     return _node().pick_up(object_label)
 
 
 def ask_user(question: str) -> dict:
+    if TEST_RUN:
+        print(f"\n[agent asks] {question}")
+        return {"answer": input("you: ").strip()}
     return _node().ask_user(question)
 
 
 def release():
     """Shut down the ROS node / executor. Called once at agent exit."""
+    if TEST_RUN:
+        return
     from air.agent_node import shutdown_node
     shutdown_node()
 
