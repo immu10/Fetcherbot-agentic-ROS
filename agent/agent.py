@@ -1,26 +1,52 @@
 """
-LLM agent: tool-calling loop over Groq.
+LangGraph-based agent: think ⇄ tool / ask_user, with the user-question state
+made explicit in the graph (instead of buried inside a tool dispatch).
 
-Reads a natural-language command, lets the model pick tools from `tools.TOOLS`,
-runs them, feeds results back, and stops when the model returns a final text
-response.
+Graph shape:
 
-Run (from the project root):
+                       START
+                         │
+                         ▼
+                       think  ◄─────────────────┐
+                         │                       │
+            ┌────────────┼────────────┐          │
+            ▼            ▼            ▼          │
+        exec_tool    ask_user       finish       │
+            │            │            │          │
+            └────┬───────┘            │          │
+                 │ (loops back)       │          │
+                 └────────────────────┼──────────┘
+                                      ▼
+                                     END
+
+Public API:
+    run(command: str) -> str
+
+Same signature as the previous Groq-only loop, so agent_node imports unchanged.
+
+Run (standalone):
     python -m agent.agent             # type a command at the prompt
-    python -m agent.agent "fetch the pen"
+    python -m agent.agent "fetch the cup"
 
-Requires GROQ_API_KEY in the environment or in a .env file at the project root.
+Requires GROQ_API_KEY in the environment or in a .env at the project root.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import operator
 import os
 import sys
+from typing import Annotated, List, TypedDict
 
 from dotenv import load_dotenv
-from groq import Groq
+from langchain_core.messages import (
+    AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage,
+)
+from langchain_core.tools import tool
+from langchain_groq import ChatGroq
+from langgraph.graph import END, StateGraph
 
 try:
     from . import tools as agent_tools          # `python -m agent.agent`
@@ -30,21 +56,16 @@ except ImportError:
 # Load .env from the project root (one dir above this file).
 load_dotenv(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))
 
-# Free-tier friendly. Alternatives:
-#   "llama-3.1-8b-instant"      — much faster, less reliable with tools
-#   "openai/gpt-oss-20b"        — decent middle ground
+# ---------- knobs ----------
 MODEL = "llama-3.3-70b-versatile"
 MAX_TOKENS = 1024
-MAX_TURNS = 12  # safety cap on the tool-use loop
+RECURSION_LIMIT = 50  # caps total node visits per run; LangGraph's MAX_TURNS analog.
 
-# Shared file logger configured by agent_node._setup_file_logging(). When run
-# standalone (`python -m agent.agent`), it has no handlers and our calls are
-# silent — that's fine, this module isn't the place to set up logging policy.
+# Shared file logger configured by agent_node._setup_file_logging(). Silent
+# when run standalone (no handlers attached).
 _log = logging.getLogger("air")
 
-# AIR_LLM_DEBUG=1 dumps the full request body (every message, every tool
-# schema) and the full response body to the log file. Default OFF — verbose
-# but invaluable when an answer surprises you.
+# AIR_LLM_DEBUG=1 dumps full request + response bodies to the log file.
 _LLM_DEBUG = os.environ.get("AIR_LLM_DEBUG") == "1"
 
 SYSTEM_PROMPT = """You are the brain of a mobile manipulator robot.
@@ -62,121 +83,225 @@ Reasoning guidelines:
 """
 
 
-def _to_openai_tools(anthropic_tools: list[dict]) -> list[dict]:
-    """Convert Anthropic-style tool schema to OpenAI/Groq function-call schema."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["input_schema"],
-            },
-        }
-        for t in anthropic_tools
-    ]
+# ---------- LangChain tool wrappers ----------
+# Thin shims over agent_tools.DISPATCH so the underlying ROS-side logic
+# (and the IS_TEST_RUN gate) is unchanged. LangChain reads the docstring
+# and type hints to build the schema sent to Groq.
+
+@tool
+def scan_scene() -> str:
+    """Run object detection on the current camera frame.
+
+    Returns a JSON string with detected objects: labels, confidence scores,
+    bbox in pixel coords, and 3D position (when depth is available).
+    """
+    return json.dumps(agent_tools.scan_scene())
 
 
-def _run_tool(name: str, args: dict) -> str:
+@tool
+def navigate_to(x: float, y: float) -> str:
+    """Drive the robot base to the given (x, y) target position in map frame.
+
+    Returns a JSON status; status:'active' means the goal was accepted —
+    poll check_nav_status for completion.
+    """
+    return json.dumps(agent_tools.navigate_to(x=x, y=y))
+
+
+@tool
+def check_nav_status() -> str:
+    """Poll the navigation status: idle | active | succeeded | failed | canceled."""
+    return json.dumps(agent_tools.check_nav_status())
+
+
+@tool
+def pick_up(object_label: str) -> str:
+    """Plan and execute an arm trajectory to pick up the named object."""
+    return json.dumps(agent_tools.pick_up(object_label=object_label))
+
+
+@tool
+def ask_user(question: str) -> str:
+    """Ask the user a clarifying question. Blocks until the user replies on /agent/answer."""
+    return json.dumps(agent_tools.ask_user(question=question))
+
+
+TOOLS = [scan_scene, navigate_to, check_nav_status, pick_up, ask_user]
+
+
+# ---------- LLM ----------
+# Lazy: don't construct on import so AIR_LLM_ENABLED=0 (which avoids importing
+# this module entirely) doesn't pay the price, and a missing GROQ_API_KEY
+# error surfaces at run time, not import time.
+_llm = None
+
+def _get_llm():
+    global _llm
+    if _llm is None:
+        _llm = ChatGroq(model=MODEL, max_tokens=MAX_TOKENS).bind_tools(TOOLS)
+    return _llm
+
+
+# ---------- graph state ----------
+
+class AgentState(TypedDict):
+    """Threaded through every node. `operator.add` makes lists concatenate."""
+    messages: Annotated[List[AnyMessage], operator.add]
+    final_reply: str
+
+
+# ---------- nodes ----------
+
+def think_node(state: AgentState) -> dict:
+    """Send the running message history to Groq; append its reply."""
+    msgs = state["messages"]
+    _log.info(f"[graph] think: messages={len(msgs)}")
+    if _LLM_DEBUG:
+        try:
+            _log.info(f"[graph] req body: {[m.dict() for m in msgs]}")
+        except Exception:
+            pass
+
+    response: AIMessage = _get_llm().invoke(msgs)
+
+    # Token usage lives in response_metadata.token_usage on the langchain-groq
+    # response shape; guard against schema drift across versions.
+    usage = (response.response_metadata or {}).get("token_usage", {}) or {}
+    if usage:
+        _log.info(
+            f"[graph] resp: tokens prompt={usage.get('prompt_tokens')} "
+            f"completion={usage.get('completion_tokens')} total={usage.get('total_tokens')}"
+        )
+    if response.content:
+        text = response.content if isinstance(response.content, str) else str(response.content)
+        preview = text if len(text) <= 300 else text[:300] + "..."
+        _log.info(f"[graph] content: {preview!r}")
+    if response.tool_calls:
+        _log.info(f"[graph] tool_calls: {[tc['name'] for tc in response.tool_calls]}")
+    if _LLM_DEBUG:
+        try:
+            _log.info(f"[graph] resp body: {response.dict()}")
+        except Exception:
+            pass
+
+    return {"messages": [response]}
+
+
+def _run_tool(tc: dict) -> ToolMessage:
+    """Dispatch one tool call through agent_tools.DISPATCH and wrap the result.
+
+    Used by both exec_tool_node and ask_user_node — the only difference between
+    them is which calls they receive (route_after_think handles that). Keeps
+    the actual dispatch in one place so behaviour stays identical.
+    """
+    name = tc["name"]
+    args = tc.get("args") or {}
     fn = agent_tools.DISPATCH.get(name)
     if fn is None:
-        return json.dumps({"error": f"unknown tool: {name}"})
-    try:
-        result = fn(**(args or {}))
-    except Exception as e:
-        result = {"error": f"{type(e).__name__}: {e}"}
-    return json.dumps(result)
+        result = json.dumps({"error": f"unknown tool: {name}"})
+    else:
+        try:
+            output = fn(**args)
+            result = json.dumps(output)
+        except Exception as e:
+            result = json.dumps({"error": f"{type(e).__name__}: {e}"})
+    print(f"[tool] {name}({json.dumps(args)})")
+    print(f"  → {result}")
+    _log.info(f"[tool] {name}({json.dumps(args)}) → {result}")
+    return ToolMessage(content=result, tool_call_id=tc["id"], name=name)
 
+
+def exec_tool_node(state: AgentState) -> dict:
+    """Run *every* tool call from the latest assistant turn.
+
+    Reached when the LLM made any non-pure-ask_user batch. We run the whole
+    batch (including any ask_user mixed in) because OpenAI/Groq tool-calling
+    requires every assistant tool_call.id to be answered before the next
+    think iteration — splitting the batch across nodes would break that
+    invariant.
+    """
+    last = state["messages"][-1]
+    return {"messages": [_run_tool(tc) for tc in (last.tool_calls or [])]}
+
+
+def ask_user_node(state: AgentState) -> dict:
+    """Run tool calls when the assistant turn is *only* ask_user calls.
+
+    This node exists for graph clarity — it makes the user-question state a
+    first-class transition rather than a hidden side-effect inside a tool
+    dispatch. Behaviour is identical to exec_tool_node; the split is semantic.
+    """
+    last = state["messages"][-1]
+    return {"messages": [_run_tool(tc) for tc in (last.tool_calls or [])]}
+
+
+def finish_node(state: AgentState) -> dict:
+    """Capture the LLM's final natural-language reply into final_reply."""
+    last = state["messages"][-1]
+    text = last.content if isinstance(last.content, str) else str(last.content)
+    reply = (text or "").strip()
+    _log.info(f"[graph] finish: reply={reply!r}")
+    return {"final_reply": reply}
+
+
+# ---------- edges ----------
+
+def route_after_think(state: AgentState) -> str:
+    last = state["messages"][-1]
+    tcs = last.tool_calls or []
+    if not tcs:
+        return "finish"
+    # Pure user-question turn → ask_user node (visual-only routing).
+    if all(tc["name"] == "ask_user" for tc in tcs):
+        return "ask_user"
+    return "exec_tool"
+
+
+# ---------- compile ----------
+
+def _build_graph():
+    g = StateGraph(AgentState)
+    g.add_node("think",     think_node)
+    g.add_node("exec_tool", exec_tool_node)
+    g.add_node("ask_user",  ask_user_node)
+    g.add_node("finish",    finish_node)
+
+    g.set_entry_point("think")
+    g.add_conditional_edges("think", route_after_think, {
+        "exec_tool": "exec_tool",
+        "ask_user":  "ask_user",
+        "finish":    "finish",
+    })
+    g.add_edge("exec_tool", "think")
+    g.add_edge("ask_user",  "think")
+    g.add_edge("finish",    END)
+    return g.compile()
+
+
+# Compile once at import; each invoke() runs through fresh state.
+_graph = _build_graph()
+
+
+# ---------- public API ----------
 
 def run(command: str) -> str:
-    """Run the agent loop on a single user command. Returns the final reply."""
-    client = Groq()  # reads GROQ_API_KEY from env
-    tools = _to_openai_tools(agent_tools.TOOLS)
+    """Run the agent loop on a single user command. Returns the final reply.
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": command},
-    ]
-
-    _log.info(f"[groq] === run start === model={MODEL} command={command!r}")
-
-    for turn in range(1, MAX_TURNS + 1):
-        # ---- log request ----
-        _log.info(f"[groq] req turn={turn} messages={len(messages)} tools={len(tools)}")
-        if _LLM_DEBUG:
-            _log.info(f"[groq] req body: {json.dumps(messages, default=str)}")
-
-        resp = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            tools=tools,
-            tool_choice="auto",
-            messages=messages,
-        )
-
-        # ---- log response ----
-        choice = resp.choices[0]
-        msg = choice.message
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            _log.info(
-                f"[groq] resp turn={turn} finish={choice.finish_reason} "
-                f"tokens prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
-                f"total={usage.total_tokens}"
-            )
-        else:
-            _log.info(f"[groq] resp turn={turn} finish={choice.finish_reason} (no usage)")
-        if msg.content:
-            preview = msg.content if len(msg.content) <= 300 else msg.content[:300] + "..."
-            _log.info(f"[groq] content: {preview!r}")
-        if msg.tool_calls:
-            names = [tc.function.name for tc in msg.tool_calls]
-            _log.info(f"[groq] tool_calls: {names}")
-        if _LLM_DEBUG:
-            try:
-                _log.info(f"[groq] resp body: {resp.model_dump_json()}")
-            except Exception:  # SDK shape changes shouldn't kill the loop.
-                _log.info(f"[groq] resp body: {resp!r}")
-
-        # Append the assistant turn (Groq SDK objects serialize cleanly via .model_dump).
-        assistant_entry: dict = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_entry["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_entry)
-
-        if not msg.tool_calls:
-            # Final answer.
-            final = (msg.content or "").strip()
-            _log.info(f"[groq] === run end (final, turn={turn}) ===")
-            return final
-
-        # Run every tool call in this turn and feed results back.
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            call_line = f"{tc.function.name}({json.dumps(args)})"
-            print(f"[tool] {call_line}")
-            _log.info(f"[tool] {call_line}")
-            output = _run_tool(tc.function.name, args)
-            print(f"  → {output}")
-            _log.info(f"[tool]   → {output}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": output,
-            })
-
-    _log.warning(f"[groq] === run end (MAX_TURNS={MAX_TURNS} hit) ===")
-    return "(agent hit max turns without finishing)"
+    Drop-in replacement for the previous Groq-only run(); agent_node calls
+    this exactly as before.
+    """
+    _log.info(f"[graph] === run start === model={MODEL} command={command!r}")
+    initial: AgentState = {
+        "messages": [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=command),
+        ],
+        "final_reply": "",
+    }
+    final = _graph.invoke(initial, config={"recursion_limit": RECURSION_LIMIT})
+    reply = final.get("final_reply") or "(no reply)"
+    _log.info(f"[graph] === run end === reply={reply!r}")
+    return reply
 
 
 def main():

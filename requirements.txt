@@ -2,8 +2,9 @@
 # Pulls in torch, torchvision, numpy, pillow, pyyaml, etc. as deps.
 ultralytics>=8.3.0
 
-# Webcam / video I/O and frame display
-opencv-python>=4.8.0
+# Webcam / video I/O and frame display.
+# Upper-pin: 4.11+ requires numpy>=2 (incompatible with cv_bridge on Humble).
+opencv-python>=4.8.0,<4.11
 
 # Pinning numpy < 2 avoids occasional ABI mismatches with older torch builds.
 # Remove this cap once everything in the stack is numpy 2.x clean.
@@ -15,6 +16,10 @@ faster-whisper>=1.0.0
 # Microphone capture (PortAudio bindings) for the live STT mic path.
 sounddevice>=0.4.6
 
-# LLM agent: Groq tool-calling loop.
+# LLM agent — LangGraph state machine over Groq.
+# langchain-groq pulls langchain-core; langgraph builds on both.
 groq>=0.11.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+langgraph>=0.2.0
 python-dotenv>=1.0.0
