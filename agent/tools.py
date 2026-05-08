@@ -62,7 +62,7 @@ def release():
     return None
 
 
-# ---------- Claude tools schema ----------
+# ---------- Tools schema ----------
 
 TOOLS = [
     {

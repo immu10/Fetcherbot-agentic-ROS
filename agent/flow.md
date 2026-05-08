@@ -20,13 +20,17 @@ stateDiagram-v2
 
     %% ---------- Communication loop ----------
     state CommLoop {
-        [*] --> Listen
-        Listen --> Reply: generate text response\n(no robot tools called)
-        Reply --> Listen: user follows up\n(still conversational)
-        Reply --> [*]: user ends / silent
+        [*] --> Reply
+        Reply --> WaitUser: text response sent\n(no robot tools called)
+        WaitUser --> ReRoute: user speaks again
+
+        state ReRoute <<choice>>
+        ReRoute --> Reply: still conversational\n(stay in CommLoop)
+        ReRoute --> [*]: action intent detected\n(exit to ActionLoop)
+        ReRoute --> [*]: user ends / silent\n(exit to Idle)
     }
 
-    CommLoop --> Router: user issues a new command\n(intent re-check)
+    CommLoop --> ActionLoop: action intent\n(fresh command OR\nanswer that resumes\npaused action)
     CommLoop --> Idle: conversation ends
 
     %% ---------- Action loop ----------
