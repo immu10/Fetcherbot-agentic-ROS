@@ -20,6 +20,8 @@ Stubs (raise NotImplementedError until wired to Nav2 / MoveIt2):
 
 from __future__ import annotations
 
+import datetime
+import logging
 import math
 import os
 import sys
@@ -62,10 +64,50 @@ _repo_root = _find_repo_root_with_OD(__file__)
 if _repo_root and _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+# Distinguish "OD.py not on disk" from "OD.py loaded but a dep blew up". The
+# latter is far more common (pydantic / cv2 / ultralytics in ~/.local) and
+# deserves a different error message in the startup log.
 try:
     import OD  # type: ignore
-except ImportError:
-    OD = None  # YOLO disabled; scan_scene will surface a clear error.
+    _od_import_error: Optional[str] = None
+except Exception as _e:
+    OD = None
+    _od_import_error = f"{type(_e).__name__}: {_e}"
+
+
+# ---------- file logging ----------
+# Each run writes a fresh timestamped log file under <repo>/logs/. We keep this
+# OUR-side logger separate from rclpy's get_logger() (which prints to console
+# and into ~/.ros/log/<...>/) so we have a copy alongside the project source.
+# Stays a no-op if the repo root couldn't be located (e.g. OD.py was moved).
+_air_log = logging.getLogger("air.agent_node")
+_air_log.setLevel(logging.INFO)
+_air_log.propagate = False  # don't double-log via the root logger
+
+
+def _setup_file_logging() -> Optional[str]:
+    """Attach a FileHandler writing to <repo>/logs/agent_<UTC ts>.log.
+    Idempotent — repeated calls don't stack handlers. Returns the log path,
+    or None if no repo root was located."""
+    if not _repo_root:
+        return None
+    # Skip if already configured (e.g. on hot-reload).
+    if any(isinstance(h, logging.FileHandler) for h in _air_log.handlers):
+        return next(h.baseFilename for h in _air_log.handlers
+                    if isinstance(h, logging.FileHandler))
+
+    logs_dir = os.path.join(_repo_root, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(logs_dir, f"agent_{ts}.log")
+
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _air_log.addHandler(handler)
+    return log_path
 
 
 # ---------- topic configuration ----------
@@ -119,11 +161,18 @@ class AgentNode(Node):
             except Exception as e:
                 self.get_logger().error(f"YOLO load failed: {e}")
         else:
-            self.get_logger().warn(
-                "OD module not importable — scan_scene() will return an error. "
-                "Could not auto-locate OD.py by walking up from this file; check "
-                "that the repo layout still has OD.py at the project root."
-            )
+            if _repo_root is None:
+                self.get_logger().warn(
+                    "OD module not importable: could not auto-locate OD.py by "
+                    "walking up from this file. Is OD.py still at the project root?"
+                )
+            else:
+                self.get_logger().warn(
+                    f"OD module found on path ({_repo_root}) but failed to import: "
+                    f"{_od_import_error}. scan_scene() will return an error. "
+                    "Common cause: stale pydantic/cv2/ultralytics in ~/.local "
+                    "(try: pip install --user --upgrade pydantic groq ultralytics)."
+                )
 
         # Sensor data is high-volume; BEST_EFFORT keeps us from backing up
         # publishers. Camera plugins in Gazebo publish best-effort by default.
@@ -376,20 +425,22 @@ class AgentNode(Node):
         try:
             from agent.agent import run as run_agent
         except Exception as e:
-            self.get_logger().error(
-                f"could not import agent.agent.run ({type(e).__name__}: {e}); "
-                "the LLM loop is disabled. Node will idle."
-            )
+            err = f"could not import agent.agent.run ({type(e).__name__}: {e}); the LLM loop is disabled. Node will idle."
+            self.get_logger().error(err)
+            _air_log.error(err)
             threading.Event().wait()
             return
 
         self.get_logger().info("interactive loop ready — awaiting first command.")
+        _air_log.info("interactive loop ready.")
         while rclpy.ok():
             ask = self.ask_user("What would you like me to do? (type 'quit' to exit)")
             if "error" in ask:
                 # Most likely an ask_timeout. Loop and re-prompt so the user
                 # has another chance instead of dying silently.
-                self.get_logger().warn(f"ask_user: {ask['error']}; re-prompting.")
+                msg = f"ask_user: {ask['error']}; re-prompting."
+                self.get_logger().warn(msg)
+                _air_log.warning(msg)
                 continue
 
             command = (ask.get("answer") or "").strip()
@@ -397,19 +448,23 @@ class AgentNode(Node):
                 continue
             if command.lower() in ("quit", "exit", "q"):
                 self.get_logger().info("user exited interactive loop.")
+                _air_log.info("user exited interactive loop.")
                 return
 
             self.get_logger().info(f"running agent on: {command!r}")
+            _air_log.info(f"command: {command!r}")
             try:
                 reply = run_agent(command)
             except Exception as e:
                 reply = f"[error] {type(e).__name__}: {e}"
                 self.get_logger().error(reply)
+                _air_log.exception("agent.run failed")
 
             self.get_logger().info(f"[agent reply] {reply}")
-            msg = String()
-            msg.data = reply
-            self._response_pub.publish(msg)
+            _air_log.info(f"reply: {reply}")
+            out = String()
+            out.data = reply
+            self._response_pub.publish(out)
 
     def shutdown(self):
         try:
@@ -451,12 +506,17 @@ def main():
     sleep gives camera subscriptions a chance to receive their first frame so
     the LLM's opening scan_scene() doesn't return 'no RGB frame yet'.
     """
+    log_path = _setup_file_logging()
     node = get_node()
+    if log_path:
+        node.get_logger().info(f"file logging → {log_path}")
+        _air_log.info(f"agent_node started; log file = {log_path}")
     node.get_logger().info("agent_node up. Warming up subscriptions...")
     try:
         time.sleep(2.0)
         node.run_interactive_loop()
     except KeyboardInterrupt:
-        pass
+        _air_log.info("KeyboardInterrupt — shutting down.")
     finally:
+        _air_log.info("agent_node shutting down.")
         shutdown_node()
