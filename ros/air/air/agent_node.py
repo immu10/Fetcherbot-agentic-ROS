@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -40,8 +41,27 @@ from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
 
 # Import the standalone YOLO loader from the project's OD module so we don't
-# duplicate model config. OD.py lives at the repo root — make sure it's on
-# PYTHONPATH (e.g. export PYTHONPATH=$PYTHONPATH:~/airbs before ros2 run).
+# duplicate model config. OD.py lives at the repo root, which is several dirs
+# above this file. Walk upward looking for it, then prepend that dir to
+# sys.path — no PYTHONPATH export required, works under both colcon
+# --symlink-install (realpath resolves through the symlink) and a plain copy
+# install. Falls back to leaving OD as None so scan_scene can report cleanly.
+def _find_repo_root_with_OD(start: str, max_depth: int = 8) -> Optional[str]:
+    here = os.path.dirname(os.path.realpath(start))
+    for _ in range(max_depth):
+        if os.path.isfile(os.path.join(here, "OD.py")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    return None
+
+
+_repo_root = _find_repo_root_with_OD(__file__)
+if _repo_root and _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 try:
     import OD  # type: ignore
 except ImportError:
@@ -49,11 +69,14 @@ except ImportError:
 
 
 # ---------- topic configuration ----------
-# Defaults match the TurtleBot3 + Gazebo plugin convention. Override via env
-# vars if your sim publishes elsewhere (e.g. /camera/rgb/image_raw).
-RGB_TOPIC        = os.environ.get("AIR_RGB_TOPIC",        "/camera/image_raw")
-DEPTH_TOPIC      = os.environ.get("AIR_DEPTH_TOPIC",      "/camera/depth/image_raw")
-CAMERA_INFO_TOPIC = os.environ.get("AIR_CAMERA_INFO_TOPIC", "/camera/camera_info")
+# Defaults match the apt-built turtlebot3_manipulation_gazebo on Humble, which
+# publishes the Pi-camera plugin under /pi_camera/* and (currently) ships no
+# depth image at all. The depth subscription stays declared so the moment a
+# depth plugin is added the 3D back-projection just starts working — no code
+# change needed. Override via env vars if your sim publishes elsewhere.
+RGB_TOPIC         = os.environ.get("AIR_RGB_TOPIC",         "/pi_camera/image_raw")
+DEPTH_TOPIC       = os.environ.get("AIR_DEPTH_TOPIC",       "/pi_camera/depth/image_raw")
+CAMERA_INFO_TOPIC = os.environ.get("AIR_CAMERA_INFO_TOPIC", "/pi_camera/camera_info")
 
 
 _node_singleton: Optional["AgentNode"] = None
@@ -98,7 +121,8 @@ class AgentNode(Node):
         else:
             self.get_logger().warn(
                 "OD module not importable — scan_scene() will return an error. "
-                "Add the repo root to PYTHONPATH (e.g. export PYTHONPATH=$PYTHONPATH:~/airbs)."
+                "Could not auto-locate OD.py by walking up from this file; check "
+                "that the repo layout still has OD.py at the project root."
             )
 
         # Sensor data is high-volume; BEST_EFFORT keeps us from backing up
@@ -123,6 +147,7 @@ class AgentNode(Node):
         # the calling tool thread on _answer_event until the answer arrives
         # or ask_timeout_s elapses.
         self._question_pub = self.create_publisher(String, "/agent/question", 10)
+        self._response_pub = self.create_publisher(String, "/agent/response", 10)
         self.create_subscription(String, "/agent/answer", self._on_answer, 10)
         self._answer_event = threading.Event()
         self._answer_lock  = threading.Lock()
@@ -335,6 +360,57 @@ class AgentNode(Node):
             answer = self._latest_answer or ""
         return {"answer": answer}
 
+    # ---- top-level interactive loop ----
+
+    def run_interactive_loop(self):
+        """Ask → run agent → publish reply → repeat. Blocks the calling thread.
+
+        Triggered from main() once the node is up. The first prompt is broadcast
+        on /agent/question so a UI (or a `ros2 topic pub` from a human) can
+        reply on /agent/answer. Each completed run's text reply is published on
+        /agent/response. Type 'quit' / 'exit' / 'q' to exit cleanly.
+
+        Every exception inside agent.run() is caught and reported as the reply
+        — a bad GROQ_API_KEY surfaces as a one-line error, not a node crash.
+        """
+        try:
+            from agent.agent import run as run_agent
+        except Exception as e:
+            self.get_logger().error(
+                f"could not import agent.agent.run ({type(e).__name__}: {e}); "
+                "the LLM loop is disabled. Node will idle."
+            )
+            threading.Event().wait()
+            return
+
+        self.get_logger().info("interactive loop ready — awaiting first command.")
+        while rclpy.ok():
+            ask = self.ask_user("What would you like me to do? (type 'quit' to exit)")
+            if "error" in ask:
+                # Most likely an ask_timeout. Loop and re-prompt so the user
+                # has another chance instead of dying silently.
+                self.get_logger().warn(f"ask_user: {ask['error']}; re-prompting.")
+                continue
+
+            command = (ask.get("answer") or "").strip()
+            if not command:
+                continue
+            if command.lower() in ("quit", "exit", "q"):
+                self.get_logger().info("user exited interactive loop.")
+                return
+
+            self.get_logger().info(f"running agent on: {command!r}")
+            try:
+                reply = run_agent(command)
+            except Exception as e:
+                reply = f"[error] {type(e).__name__}: {e}"
+                self.get_logger().error(reply)
+
+            self.get_logger().info(f"[agent reply] {reply}")
+            msg = String()
+            msg.data = reply
+            self._response_pub.publish(msg)
+
     def shutdown(self):
         try:
             self._executor.shutdown()
@@ -370,14 +446,16 @@ def shutdown_node():
 def main():
     """Entry point for `ros2 run air agent_node` and the launch file.
 
-    For now this just brings the node up (camera subs + YOLO) and idles. Drive
-    scan_scene() from another process via the agent loop, or import
-    `air.agent_node.get_node().scan_scene()` from a Python REPL.
+    Brings up the node (camera subs + YOLO) then enters the interactive loop:
+    ask the user → run the LLM agent → publish reply → repeat. The 2s grace
+    sleep gives camera subscriptions a chance to receive their first frame so
+    the LLM's opening scan_scene() doesn't return 'no RGB frame yet'.
     """
     node = get_node()
-    node.get_logger().info("agent_node up. Ctrl-C to exit.")
+    node.get_logger().info("agent_node up. Warming up subscriptions...")
     try:
-        threading.Event().wait()
+        time.sleep(2.0)
+        node.run_interactive_loop()
     except KeyboardInterrupt:
         pass
     finally:
