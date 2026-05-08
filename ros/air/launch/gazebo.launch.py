@@ -14,6 +14,9 @@ Launch arguments:
   spawn_objects : 'false' to skip the test-object spawns (default: true).
 """
 
+import os
+import tempfile
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -107,9 +110,15 @@ def _sphere_sdf(name: str, radius: float, rgba: str) -> str:
 
 
 def _spawn(name: str, sdf_xml: str, x: float, y: float, z: float):
-    """gazebo_ros' spawn_entity.py reads SDF as a string and pokes it into the
-    running gzserver via service call. Fully ROS-side, no Gazebo plugins needed.
+    """gazebo_ros' spawn_entity.py pokes a model into the running gzserver via
+    service call. The Humble apt build accepts -file/-topic/-database/-stdin
+    (no -string), so we write the SDF to /tmp/air_<name>.sdf at launch-build
+    time and pass that path. The file persists for the run; OS cleanup on
+    reboot is fine for a sim scratch file.
     """
+    sdf_path = os.path.join(tempfile.gettempdir(), f"air_{name}.sdf")
+    with open(sdf_path, "w") as f:
+        f.write(sdf_xml)
     return Node(
         package="gazebo_ros",
         executable="spawn_entity.py",
@@ -118,7 +127,7 @@ def _spawn(name: str, sdf_xml: str, x: float, y: float, z: float):
         arguments=[
             "-entity", name,
             "-x", str(x), "-y", str(y), "-z", str(z),
-            "-string", sdf_xml,
+            "-file", sdf_path,
         ],
     )
 
