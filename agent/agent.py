@@ -15,6 +15,7 @@ Requires GROQ_API_KEY in the environment or in a .env file at the project root.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 
@@ -35,6 +36,16 @@ load_dotenv(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))
 MODEL = "llama-3.3-70b-versatile"
 MAX_TOKENS = 1024
 MAX_TURNS = 12  # safety cap on the tool-use loop
+
+# Shared file logger configured by agent_node._setup_file_logging(). When run
+# standalone (`python -m agent.agent`), it has no handlers and our calls are
+# silent — that's fine, this module isn't the place to set up logging policy.
+_log = logging.getLogger("air")
+
+# AIR_LLM_DEBUG=1 dumps the full request body (every message, every tool
+# schema) and the full response body to the log file. Default OFF — verbose
+# but invaluable when an answer surprises you.
+_LLM_DEBUG = os.environ.get("AIR_LLM_DEBUG") == "1"
 
 SYSTEM_PROMPT = """You are the brain of a mobile manipulator robot.
 
@@ -87,7 +98,14 @@ def run(command: str) -> str:
         {"role": "user", "content": command},
     ]
 
-    for _ in range(MAX_TURNS):
+    _log.info(f"[groq] === run start === model={MODEL} command={command!r}")
+
+    for turn in range(1, MAX_TURNS + 1):
+        # ---- log request ----
+        _log.info(f"[groq] req turn={turn} messages={len(messages)} tools={len(tools)}")
+        if _LLM_DEBUG:
+            _log.info(f"[groq] req body: {json.dumps(messages, default=str)}")
+
         resp = client.chat.completions.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -96,7 +114,29 @@ def run(command: str) -> str:
             messages=messages,
         )
 
-        msg = resp.choices[0].message
+        # ---- log response ----
+        choice = resp.choices[0]
+        msg = choice.message
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            _log.info(
+                f"[groq] resp turn={turn} finish={choice.finish_reason} "
+                f"tokens prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
+                f"total={usage.total_tokens}"
+            )
+        else:
+            _log.info(f"[groq] resp turn={turn} finish={choice.finish_reason} (no usage)")
+        if msg.content:
+            preview = msg.content if len(msg.content) <= 300 else msg.content[:300] + "..."
+            _log.info(f"[groq] content: {preview!r}")
+        if msg.tool_calls:
+            names = [tc.function.name for tc in msg.tool_calls]
+            _log.info(f"[groq] tool_calls: {names}")
+        if _LLM_DEBUG:
+            try:
+                _log.info(f"[groq] resp body: {resp.model_dump_json()}")
+            except Exception:  # SDK shape changes shouldn't kill the loop.
+                _log.info(f"[groq] resp body: {resp!r}")
 
         # Append the assistant turn (Groq SDK objects serialize cleanly via .model_dump).
         assistant_entry: dict = {"role": "assistant", "content": msg.content or ""}
@@ -113,7 +153,9 @@ def run(command: str) -> str:
 
         if not msg.tool_calls:
             # Final answer.
-            return (msg.content or "").strip()
+            final = (msg.content or "").strip()
+            _log.info(f"[groq] === run end (final, turn={turn}) ===")
+            return final
 
         # Run every tool call in this turn and feed results back.
         for tc in msg.tool_calls:
@@ -121,15 +163,19 @@ def run(command: str) -> str:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            print(f"[tool] {tc.function.name}({json.dumps(args)})")
+            call_line = f"{tc.function.name}({json.dumps(args)})"
+            print(f"[tool] {call_line}")
+            _log.info(f"[tool] {call_line}")
             output = _run_tool(tc.function.name, args)
             print(f"  → {output}")
+            _log.info(f"[tool]   → {output}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": output,
             })
 
+    _log.warning(f"[groq] === run end (MAX_TURNS={MAX_TURNS} hit) ===")
     return "(agent hit max turns without finishing)"
 
 

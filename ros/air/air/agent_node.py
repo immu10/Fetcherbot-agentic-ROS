@@ -64,6 +64,17 @@ _repo_root = _find_repo_root_with_OD(__file__)
 if _repo_root and _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+# Load .env from the repo root so AIR_LLM_ENABLED, AIR_LLM_DEBUG, GROQ_API_KEY
+# etc. are visible to this process. Topic env vars (AIR_RGB_TOPIC, ...) are
+# read at module top below; if you want to override those, use a shell export
+# instead — by the time agent_node imports those constants, .env is loaded.
+if _repo_root:
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _load_dotenv(os.path.join(_repo_root, ".env"))
+    except Exception:
+        pass  # dotenv missing or .env absent — env-var fallback still works
+
 # Distinguish "OD.py not on disk" from "OD.py loaded but a dep blew up". The
 # latter is far more common (pydantic / cv2 / ultralytics in ~/.local) and
 # deserves a different error message in the startup log.
@@ -80,7 +91,7 @@ except Exception as _e:
 # OUR-side logger separate from rclpy's get_logger() (which prints to console
 # and into ~/.ros/log/<...>/) so we have a copy alongside the project source.
 # Stays a no-op if the repo root couldn't be located (e.g. OD.py was moved).
-_air_log = logging.getLogger("air.agent_node")
+_air_log = logging.getLogger("air")
 _air_log.setLevel(logging.INFO)
 _air_log.propagate = False  # don't double-log via the root logger
 
@@ -409,6 +420,38 @@ class AgentNode(Node):
             answer = self._latest_answer or ""
         return {"answer": answer}
 
+    # ---- scan-only loop (LLM disabled) ----
+
+    def run_scan_only_loop(self, period_s: float = 5.0):
+        """Periodically run scan_scene() and log the result. No LLM, no tokens.
+
+        Used when AIR_LLM_ENABLED=0. Lets you verify the camera + YOLO path in
+        isolation while you're still iterating on Gazebo models / lighting.
+        """
+        self.get_logger().info(f"scan-only loop (LLM disabled) — every {period_s}s.")
+        _air_log.info(f"scan-only loop started (period={period_s}s)")
+        while rclpy.ok():
+            result = self.scan_scene()
+            if "error" in result:
+                self.get_logger().warn(f"scan_scene: {result['error']}")
+                _air_log.warning(f"scan_scene error: {result['error']}")
+            else:
+                dets = result.get("detections", [])
+                if dets:
+                    summary = ", ".join(
+                        f"{d['label']}({d['confidence']:.2f})" for d in dets
+                    )
+                    self.get_logger().info(f"detections: {summary}")
+                    _air_log.info(f"detections: {summary}  raw={dets}")
+                else:
+                    self.get_logger().info("no detections")
+                    _air_log.info("detections: (none)")
+            # Sleep in small slices so Ctrl-C / rclpy.shutdown wakes us promptly.
+            slept = 0.0
+            while rclpy.ok() and slept < period_s:
+                time.sleep(0.2)
+                slept += 0.2
+
     # ---- top-level interactive loop ----
 
     def run_interactive_loop(self):
@@ -514,7 +557,15 @@ def main():
     node.get_logger().info("agent_node up. Warming up subscriptions...")
     try:
         time.sleep(2.0)
-        node.run_interactive_loop()
+        # AIR_LLM_ENABLED=0 in .env (or shell) skips the LLM entirely and just
+        # logs periodic YOLO scans. Default: enabled.
+        llm_enabled = os.environ.get("AIR_LLM_ENABLED", "1") == "1"
+        if llm_enabled:
+            node.run_interactive_loop()
+        else:
+            node.get_logger().info("AIR_LLM_ENABLED=0 — running scan-only loop.")
+            _air_log.info("LLM disabled via AIR_LLM_ENABLED=0; scan-only mode.")
+            node.run_scan_only_loop()
     except KeyboardInterrupt:
         _air_log.info("KeyboardInterrupt — shutting down.")
     finally:

@@ -14,9 +14,6 @@ Launch arguments:
   spawn_objects : 'false' to skip the test-object spawns (default: true).
 """
 
-import os
-import tempfile
-
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -40,85 +37,15 @@ TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
 TB3_SIM_LAUNCH  = "gazebo.launch.py"
 
 
-# ---------- inline SDF for the test objects ----------
-# Inline strings beat shipping model files: no extra install rules, no model
-# path env-var dance, deterministic across machines. Everything below is a
-# plain primitive shape with reasonable mass/inertia so MoveIt's gripper can
-# actually pick it up without explosions.
+# ---------- spawning real Gazebo models ----------
+# Switched away from inline-SDF primitive shapes to Gazebo's bundled model
+# database — the YOLO11/COCO labels are far more useful when the visuals are
+# actual textured objects ("bottle", "cup", "sports ball") instead of bare
+# coloured cubes. spawn_entity.py's -database flag pulls the named model from
+# Gazebo's model db (cached under ~/.gazebo/models/ after first fetch); a
+# working internet connection is needed once, after that it's offline-friendly.
 
-def _box_sdf(name: str, size: float, rgba: str) -> str:
-    return f"""<?xml version='1.0'?>
-<sdf version='1.7'>
-  <model name='{name}'>
-    <static>false</static>
-    <link name='link'>
-      <inertial>
-        <mass>0.05</mass>
-        <inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz>
-                 <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
-      </inertial>
-      <collision name='c'><geometry><box><size>{size} {size} {size}</size></box></geometry></collision>
-      <visual name='v'>
-        <geometry><box><size>{size} {size} {size}</size></box></geometry>
-        <material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse></material>
-      </visual>
-    </link>
-  </model>
-</sdf>"""
-
-
-def _cylinder_sdf(name: str, radius: float, length: float, rgba: str) -> str:
-    return f"""<?xml version='1.0'?>
-<sdf version='1.7'>
-  <model name='{name}'>
-    <static>false</static>
-    <link name='link'>
-      <inertial>
-        <mass>0.05</mass>
-        <inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz>
-                 <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
-      </inertial>
-      <collision name='c'><geometry><cylinder><radius>{radius}</radius><length>{length}</length></cylinder></geometry></collision>
-      <visual name='v'>
-        <geometry><cylinder><radius>{radius}</radius><length>{length}</length></cylinder></geometry>
-        <material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse></material>
-      </visual>
-    </link>
-  </model>
-</sdf>"""
-
-
-def _sphere_sdf(name: str, radius: float, rgba: str) -> str:
-    return f"""<?xml version='1.0'?>
-<sdf version='1.7'>
-  <model name='{name}'>
-    <static>false</static>
-    <link name='link'>
-      <inertial>
-        <mass>0.05</mass>
-        <inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz>
-                 <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
-      </inertial>
-      <collision name='c'><geometry><sphere><radius>{radius}</radius></sphere></geometry></collision>
-      <visual name='v'>
-        <geometry><sphere><radius>{radius}</radius></sphere></geometry>
-        <material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse></material>
-      </visual>
-    </link>
-  </model>
-</sdf>"""
-
-
-def _spawn(name: str, sdf_xml: str, x: float, y: float, z: float):
-    """gazebo_ros' spawn_entity.py pokes a model into the running gzserver via
-    service call. The Humble apt build accepts -file/-topic/-database/-stdin
-    (no -string), so we write the SDF to /tmp/air_<name>.sdf at launch-build
-    time and pass that path. The file persists for the run; OS cleanup on
-    reboot is fine for a sim scratch file.
-    """
-    sdf_path = os.path.join(tempfile.gettempdir(), f"air_{name}.sdf")
-    with open(sdf_path, "w") as f:
-        f.write(sdf_xml)
+def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
     return Node(
         package="gazebo_ros",
         executable="spawn_entity.py",
@@ -127,7 +54,7 @@ def _spawn(name: str, sdf_xml: str, x: float, y: float, z: float):
         arguments=[
             "-entity", name,
             "-x", str(x), "-y", str(y), "-z", str(z),
-            "-file", sdf_path,
+            "-database", db_model,
         ],
     )
 
@@ -147,21 +74,21 @@ def generate_launch_description():
         ),
     )
 
-    # 2) Test objects, sized for the OpenManipulator-X gripper (~2cm jaw width).
-    #    Coordinates are in the `world` (== `map`) frame. The robot spawns at
-    #    the origin facing +X, so these land in front of the robot, well within
-    #    camera FOV and arm reach (~30cm radius).
-    cube_x, cube_y       = 0.45,  0.00
-    cylinder_x, cylinder_y = 0.45,  0.15
-    sphere_x, sphere_y   = 0.45, -0.15
-
+    # 2) Test objects in front of the robot (origin = robot center, +X = forward).
+    #    The model names below come from Gazebo's bundled database; the third
+    #    column is the COCO class YOLO11 will most likely return.
+    #
+    #      coke_can       → "bottle"      (sometimes "cup" depending on angle)
+    #      plastic_cup    → "cup"
+    #      cricket_ball   → "sports ball"
+    #
+    #    All three cache under ~/.gazebo/models/ after first fetch. If Gazebo
+    #    can't reach its database, swap to local SDFs (see git history) or use
+    #    Ignition Fuel `<include><uri>https://fuel...</uri></include>`.
     spawns = [
-        _spawn("red_cube",    _box_sdf("red_cube", 0.03, "0.8 0.1 0.1 1"),
-               cube_x, cube_y, 0.05),
-        _spawn("blue_can",    _cylinder_sdf("blue_can", 0.025, 0.08, "0.1 0.2 0.9 1"),
-               cylinder_x, cylinder_y, 0.05),
-        _spawn("green_ball",  _sphere_sdf("green_ball", 0.025, "0.1 0.7 0.2 1"),
-               sphere_x, sphere_y, 0.05),
+        _spawn_db("coke",  "coke_can",     x=0.45, y=0.00,  z=0.05),
+        _spawn_db("cup",   "plastic_cup",  x=0.45, y=0.15,  z=0.05),
+        _spawn_db("ball",  "cricket_ball", x=0.45, y=-0.15, z=0.05),
     ]
 
     # Gazebo + ros2_control + URDF parsing takes a few seconds. Spawning objects
