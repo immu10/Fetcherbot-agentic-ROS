@@ -33,8 +33,8 @@ from launch_ros.substitutions import FindPackageShare
 # Gazebo, spawns the Waffle-Pi base + OpenManipulator-X arm with ros2_control,
 # AND starts MoveIt2 in one shot — so we don't need a separate MoveIt include.
 # -----------------------------------------------------------------------------
-TB3_SIM_PACKAGE = "turtlebot3_manipulation_moveit_config"
-TB3_SIM_LAUNCH  = "moveit_gazebo.launch.py"
+TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
+TB3_SIM_LAUNCH  = "gazebo.launch.py"
 
 
 # ---------- inline SDF for the test objects ----------
