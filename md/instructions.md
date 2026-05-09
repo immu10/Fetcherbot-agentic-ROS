@@ -21,6 +21,7 @@ sudo apt install -y \
     ros-humble-turtlebot3-manipulation \
     ros-humble-turtlebot3-manipulation-gazebo \
     ros-humble-turtlebot3-manipulation-navigation2 \
+    ros-humble-nav2-bringup \
     ros-humble-slam-toolbox \
     ros-humble-cv-bridge \
     ros-humble-image-geometry \

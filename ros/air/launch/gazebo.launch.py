@@ -119,17 +119,23 @@ def generate_launch_description():
     )
     delayed_slam = TimerAction(period=6.0, actions=[slam_launch])
 
-    # 4) Nav2 — uses the sim-time variant so it matches gzserver's clock.
-    #    Exposes /navigate_to_pose (NavigateToPose action) which agent_node's
-    #    navigate_to() calls. Comes up later than SLAM so the costmap has a
-    #    /map topic to subscribe to immediately.
+    # 4) Nav2 — `nav2_bringup/navigation_launch.py` brings up only the planner +
+    #    controller + bt_navigator + costmaps; it skips map_server and AMCL,
+    #    which means it consumes /map from whoever publishes it (here:
+    #    slam_toolbox in mapping mode, live).
+    #
+    #    We deliberately do NOT use turtlebot3_manipulation_navigation2's
+    #    navigation2.launch.py — that one expects a saved map file path and
+    #    blows up with "No such file or directory: ''" if you don't pass one.
+    #    For live-SLAM workflows the bringup variant is the right pick.
     nav2_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
-                FindPackageShare("turtlebot3_manipulation_navigation2"),
-                "launch", "navigation2_use_sim_time.launch.py",
+                FindPackageShare("nav2_bringup"),
+                "launch", "navigation_launch.py",
             ])
         ),
+        launch_arguments={"use_sim_time": "true"}.items(),
     )
     delayed_nav2 = TimerAction(period=8.0, actions=[nav2_launch])
 
