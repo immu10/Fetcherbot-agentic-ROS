@@ -42,6 +42,12 @@ def scan_scene() -> dict:
     return _node().scan_scene()
 
 
+def look_around() -> dict:
+    if IS_TEST_RUN:
+        return _FAKE_SCENE  # same canned scene; test path doesn't move the bot
+    return _node().look_around()
+
+
 def navigate_to(x: float, y: float) -> dict:
     if IS_TEST_RUN:
         # Pretend (1.2, 0.4) is blocked so the agent has to replan.
@@ -49,6 +55,12 @@ def navigate_to(x: float, y: float) -> dict:
             return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
         return {"status": "success", "reason": f"arrived at ({x}, {y})"}
     return _node().navigate_to(x, y)
+
+
+def approach(x: float, y: float, stop_distance: float = 0.30) -> dict:
+    if IS_TEST_RUN:
+        return {"status": "succeeded", "reason": f"approached ({x}, {y}) within {stop_distance}m"}
+    return _node().approach(x, y, stop_distance)
 
 
 def check_nav_status() -> dict:
@@ -136,7 +148,9 @@ TOOLS = [
 
 DISPATCH = {
     "scan_scene": lambda **_: scan_scene(),
+    "look_around": lambda **_: look_around(),
     "navigate_to": lambda **kw: navigate_to(**kw),
+    "approach": lambda **kw: approach(**kw),
     "check_nav_status": lambda **_: check_nav_status(),
     "pick_up": lambda **kw: pick_up(**kw),
     "ask_user": lambda **kw: ask_user(**kw),

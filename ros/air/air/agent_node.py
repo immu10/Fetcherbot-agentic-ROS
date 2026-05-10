@@ -41,6 +41,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
@@ -232,6 +233,12 @@ class AgentNode(Node):
         self._nav_goal_handle = None
         self._nav_last_status: Optional[int] = None  # last terminal GoalStatus.
 
+        # ---- direct base velocity publisher ----
+        # Used by look_around() to spin the bot in place. Bypasses Nav2 — fine
+        # for in-place rotation. Don't issue both this and navigate_to at the
+        # same time; the diff_drive plugin will use whatever arrived last.
+        self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
         # Spin on a background thread so synchronous tool calls work.
         self._executor = MultiThreadedExecutor()
         self._executor.add_node(self)
@@ -339,6 +346,62 @@ class AgentNode(Node):
             })
 
         return {"detections": detections}
+
+    def look_around(
+        self,
+        num_scans: int = 8,
+        scan_period_s: float = 1.5,
+        angular_speed_rad_s: float = 0.6,
+    ) -> dict:
+        """Spin in place while scanning periodically; return merged detections.
+
+        Default: 8 scans across one full rotation (~13 s). Useful when the LLM
+        is asked "what do you see" and a single forward scan misses things off
+        to the sides — also helps with low-confidence detections by giving
+        YOLO multiple shots at each object from slightly different angles.
+
+        Detections are deduplicated by (label, position rounded to 10 cm). The
+        first sighting wins (we keep its bbox + confidence).
+
+        Returns:
+            {"detections": [...], "scans_done": N}
+        """
+        twist = Twist()
+        twist.angular.z = float(angular_speed_rad_s)
+        stop = Twist()  # zero by default
+
+        merged: list[dict] = []
+        seen: set = set()
+
+        try:
+            for _ in range(num_scans):
+                # Drive rotation for one scan period before scanning. Publishing
+                # cmd_vel at ~10 Hz keeps the diff_drive plugin happy (it
+                # otherwise stops the bot if it stops hearing commands).
+                end = time.time() + scan_period_s
+                while time.time() < end:
+                    self._cmd_vel_pub.publish(twist)
+                    time.sleep(0.1)
+
+                snap = self.scan_scene()
+                for det in snap.get("detections", []):
+                    pos = det.get("position") or {}
+                    key = (
+                        det.get("label"),
+                        round(pos.get("x", 0.0), 1),
+                        round(pos.get("y", 0.0), 1),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(det)
+        finally:
+            # Always stop the bot on exit, even if scan_scene threw.
+            for _ in range(3):
+                self._cmd_vel_pub.publish(stop)
+                time.sleep(0.05)
+
+        return {"detections": merged, "scans_done": num_scans}
 
     def _pixel_to_camera_xyz(
         self,
@@ -477,6 +540,50 @@ class AgentNode(Node):
         self._nav_last_status = None
         self.get_logger().info(f"navigate_to: goal accepted target=({x:.2f}, {y:.2f})")
         return {"status": "active", "target": {"x": float(x), "y": float(y)}}
+
+    def approach(self, x: float, y: float, stop_distance: float = 0.30) -> dict:
+        """Drive toward (x, y) but stop `stop_distance` metres short.
+
+        Two-stage detection workflow: a low-confidence YOLO hit gives the LLM
+        a rough xy. Calling approach() with that xy gets the bot close enough
+        to scan_scene() again at high confidence — without overshooting and
+        running into the object.
+
+        Implementation: look up current robot pose in map frame, compute the
+        unit vector from bot → target, back off `stop_distance` along that
+        vector, then call navigate_to() with the resulting "stop point".
+        Returns the same dict shape as navigate_to().
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                "map", "base_footprint",
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.5),
+            )
+        except Exception as e:
+            return {"status": "failed", "reason": f"tf lookup map<-base_footprint failed: {e}"}
+
+        rx = t.transform.translation.x
+        ry = t.transform.translation.y
+        dx = float(x) - rx
+        dy = float(y) - ry
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist <= stop_distance:
+            return {
+                "status": "succeeded",
+                "reason": f"already within {stop_distance:.2f}m of ({x:.2f}, {y:.2f}) — distance was {dist:.2f}m",
+            }
+
+        # Walk back from the target toward the bot by stop_distance.
+        scale = (dist - stop_distance) / dist
+        tx = rx + dx * scale
+        ty = ry + dy * scale
+        self.get_logger().info(
+            f"approach: bot=({rx:.2f},{ry:.2f}) target=({x:.2f},{y:.2f}) "
+            f"→ stop=({tx:.2f},{ty:.2f}) (was {dist:.2f}m, stop {stop_distance:.2f}m)"
+        )
+        return self.navigate_to(tx, ty)
 
     def check_nav_status(self) -> dict:
         """Map the current Nav2 goal state to a coarse status string for the LLM.

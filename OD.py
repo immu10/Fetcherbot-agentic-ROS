@@ -15,7 +15,9 @@ import cv2
 from ultralytics import YOLO
 
 MODEL_PATH = "yolo11s.pt"
-CONF = 0.35
+CONF = 0.10  # Sim objects (Gazebo textures + sim lighting) score lower than
+             # real-world photos. 0.35 was killing legit detections; bump back
+             # up if you start seeing too many false positives.
 IOU = 0.5
 
 

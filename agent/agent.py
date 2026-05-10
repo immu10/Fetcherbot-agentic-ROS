@@ -80,12 +80,28 @@ _LLM_DEBUG = os.environ.get("AIR_LLM_DEBUG") == "1"
 
 @tool
 def scan_scene() -> str:
-    """Run object detection on the current camera frame.
+    """Run object detection on the current camera frame (single snapshot).
 
     Returns a JSON string with detected objects: labels, confidence scores,
-    bbox in pixel coords, and 3D position (when depth is available).
+    bbox in pixel coords, and 3D position in map frame. Use this for a quick
+    check of what's directly in front of the robot. If the result is empty
+    or you suspect things are out of view, prefer look_around() instead.
     """
     return json.dumps(agent_tools.scan_scene())
+
+
+@tool
+def look_around() -> str:
+    """Spin the robot in place 360°, scanning periodically; return merged
+    detections from all viewpoints.
+
+    Use this when asked open-ended questions like "what do you see?" or when
+    a single scan_scene() returned nothing — the object you're looking for
+    might be off to the side. Takes ~13 seconds. Detections are deduplicated
+    by label + position, so the same object seen from multiple angles
+    appears once.
+    """
+    return json.dumps(agent_tools.look_around())
 
 
 @tool
@@ -96,6 +112,19 @@ def navigate_to(x: float, y: float) -> str:
     poll check_nav_status for completion.
     """
     return json.dumps(agent_tools.navigate_to(x=x, y=y))
+
+
+@tool
+def approach(x: float, y: float, stop_distance: float = 0.30) -> str:
+    """Drive toward (x, y) but stop `stop_distance` metres short.
+
+    Use this when you have a low-confidence detection and want to get close
+    enough to scan_scene() again confidently. After calling, poll
+    check_nav_status until 'succeeded', then re-scan to confirm.
+    Default stop_distance: 30 cm — close enough for high-confidence YOLO,
+    far enough to not collide.
+    """
+    return json.dumps(agent_tools.approach(x=x, y=y, stop_distance=stop_distance))
 
 
 @tool
@@ -116,7 +145,7 @@ def ask_user(question: str) -> str:
     return json.dumps(agent_tools.ask_user(question=question))
 
 
-TOOLS = [scan_scene, navigate_to, check_nav_status, pick_up, ask_user]
+TOOLS = [scan_scene, look_around, navigate_to, approach, check_nav_status, pick_up, ask_user]
 
 
 # ---------- LLM ----------
