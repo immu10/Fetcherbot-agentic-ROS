@@ -1,100 +1,166 @@
 # Agent Flow
 
-Two-mode agent: a **communication loop** for chit-chat / questions / clarifications,
-and an **action loop** for physical tasks (scan, navigate, pick up).
-The router classifies each user turn and chooses the loop. The action loop can
-fall back into communication when it needs the user (clarification, failure
-report), and communication can escalate into action when intent shifts.
+The agent runs in two layers:
 
-## State graph
+- **Outer ring** lives in [ros/air/air/agent_node.py](../ros/air/air/agent_node.py) — owns the
+  ROS topics (`/agent/question`, `/agent/answer`, `/agent/response`) and the
+  read-command → run-agent → publish-reply loop.
+- **Inner ring** lives in [agent/agent.py](agent.py) — a LangGraph state machine that
+  takes one user command, calls Groq + tools until a final reply is produced,
+  returns the reply.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
+---
 
-    Idle --> Router: user command
+## The whole picture
 
-    state Router <<choice>>
-    Router --> CommLoop: intent = communication\n(question, chit-chat,\nstatus query, ack)
-    Router --> ActionLoop: intent = navigation/manipulation\n(verb + target:\n"fetch", "go to", "pick up")
-
-    %% ---------- Communication loop ----------
-    state CommLoop {
-        [*] --> Reply
-        Reply --> WaitUser: text response sent\n(no robot tools called)
-        WaitUser --> ReRoute: user speaks again
-
-        state ReRoute <<choice>>
-        ReRoute --> Reply: still conversational\n(stay in CommLoop)
-        ReRoute --> [*]: action intent detected\n(exit to ActionLoop)
-        ReRoute --> [*]: user ends / silent\n(exit to Idle)
-    }
-
-    CommLoop --> ActionLoop: action intent\n(fresh command OR\nanswer that resumes\npaused action)
-    CommLoop --> Idle: conversation ends
-
-    %% ---------- Action loop ----------
-    state ActionLoop {
-        [*] --> Plan
-        Plan --> Scan: needs world state
-        Scan --> Plan: detections returned
-
-        Plan --> Navigate: target chosen
-        Navigate --> CheckNav
-        CheckNav --> Navigate: in progress / replan
-        CheckNav --> Plan: arrived
-
-        Plan --> Pick: at target, object in reach
-        Pick --> Plan: success / retry once
-
-        Plan --> Done: task complete
-        Done --> [*]
-    }
-
-    ActionLoop --> CommLoop: ask_user(question)\n(ambiguous target,\nrepeated failure,\nmissing info)
-    CommLoop --> ActionLoop: user answers\n→ resume action with new info
-
-    ActionLoop --> Idle: task done\n(short confirmation to user)
+```
+                    ┌──────────────┐
+START ─────────────►│ wait_for_cmd │ ◄────────────────────────────┐
+                    │  (publish    │                               │
+                    │   prompt,    │                               │
+                    │   await ans  │                               │
+                    │   on /agent/ │                               │
+                    │   answer)    │                               │
+                    └──────┬───────┘                               │
+                           │ command                                │
+                           ▼                                        │
+                    ┌──────────────┐                                │
+                    │    think     │ ◄──────────────────┐           │
+                    │  (groq call  │                     │           │
+                    │   via LangGr │                     │           │
+                    │   aph node)  │                     │           │
+                    └──────┬───────┘                     │           │
+                           │                              │           │
+            ┌──────────────┼──────────────┐               │           │
+            │ tool_calls:  │ tool_calls:  │ no tool_calls│           │
+            │ any non-     │ only         │ (final text) │           │
+            │ ask_user     │ ask_user     │              │           │
+            ▼              ▼              ▼              │           │
+     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐    │           │
+     │  exec_tool  │ │  ask_user   │ │   finish    │    │           │
+     │ (scan_scene,│ │ (publish Q  │ │ (capture    │    │           │
+     │  navigate_  │ │  on /agent/ │ │  reply into │    │           │
+     │  to, check_ │ │  question,  │ │  state.     │    │           │
+     │  nav_status,│ │  await ans  │ │  final_     │    │           │
+     │  pick_up,   │ │  on /agent/ │ │  reply)     │    │           │
+     │  ask_user   │ │  answer)    │ └──────┬──────┘    │           │
+     │  if mixed)  │ │             │        │           │           │
+     └──────┬──────┘ └──────┬──────┘        │           │           │
+            │ ToolMessage   │ ToolMessage   │ END       │           │
+            │ appended      │ appended      │ of run    │           │
+            └───────┬───────┘               │           │           │
+                    │                        │           │           │
+                    └────────────────────────┼───────────┘           │
+                          (back to think)    │                       │
+                                              ▼                       │
+                                    ┌──────────────────┐              │
+                                    │  publish_reply   │              │
+                                    │ (push final text │              │
+                                    │  on /agent/      │              │
+                                    │  response)       │              │
+                                    └────────┬─────────┘              │
+                                             │                        │
+                                             └────────────────────────┘
+                                                  (loop forever
+                                                   until "quit"
+                                                   or Ctrl-C)
 ```
 
-## Router rules (first pass)
+The dotted region inside the second column (`think` / `exec_tool` / `ask_user` /
+`finish`) is the **LangGraph** in [agent/agent.py](agent.py).
 
-The router is a lightweight LLM call (or a cheap classifier) that tags each
-incoming user turn as one of:
+The outer ring (`wait_for_cmd` / `publish_reply`) lives in
+[agent_node.run_interactive_loop](../ros/air/air/agent_node.py).
 
-| Intent          | Examples                                          | Goes to     |
-| --------------- | ------------------------------------------------- | ----------- |
-| `communication` | "do you have a pen there?", "what can you see?", "hi", "thanks" | CommLoop    |
-| `navigation`    | "go to the kitchen", "come here", "back up"       | ActionLoop  |
-| `manipulation`  | "fetch the pen", "pick up the eraser", "hand me X"| ActionLoop  |
-| `status_query`  | "are you done?", "where are you?"                 | CommLoop (reads state, no motion) |
-| `abort`         | "stop", "cancel"                                  | ActionLoop → Done (early exit) |
+---
 
-Heuristics for borderline cases:
-- "Do you have / can you see X" → **communication**, answer from last scan
-  cache; only re-scan if explicitly asked.
-- "Get me X" / "bring X" → **manipulation**.
-- A bare noun ("the pen?") inherits intent from the previous turn.
+## Nodes (inner graph)
 
-## Loop boundaries (what each mode is *allowed* to do)
+| Node | What it does | Implemented in |
+|---|---|---|
+| `think` | Send running message history to Groq, append the response (`AIMessage`). Logs token counts, finish reason, and tool-call names. | `think_node` |
+| `exec_tool` | Run every tool call from the latest assistant turn through `agent_tools.DISPATCH`. Used when the LLM mixed any non-`ask_user` calls (or only non-`ask_user`). | `exec_tool_node` |
+| `ask_user` | Run when the assistant turn is **only** `ask_user` calls. Same dispatch as `exec_tool`; the split exists to make user-question pauses a visible graph state. | `ask_user_node` |
+| `finish` | Capture the LLM's final natural-language reply into `state.final_reply`. | `finish_node` |
 
-**CommLoop** — text only. Allowed tools: `scan_scene` (read-only), `ask_user`.
-Forbidden: `navigate_to`, `pick_up`. If the model tries to call a motion tool
-here, the router escalates to ActionLoop instead of executing it.
+All four log to `logs/agent_*.log` via the `air` logger.
 
-**ActionLoop** — full tool set. Must end with either:
-- a success confirmation → return to Idle, or
-- an `ask_user` call → hand control to CommLoop, keep action context alive so
-  the next user turn can resume mid-task.
+---
 
-## Open questions for cross-check
+## Routing rule (`route_after_think`)
 
-1. Should the router be a separate LLM call, or fold the decision into the
-   action-loop system prompt with a "respond with text only if conversational"
-   instruction? (Separate call = cleaner; folded = one fewer round trip.)
-2. When CommLoop is paused mid-action (waiting on `ask_user`), how long do we
-   keep the action context before timing out back to Idle?
-3. Does `status_query` need its own mini-loop, or is it just a one-shot read of
-   cached state inside CommLoop?
-4. On `abort`, do we cancel in-flight Nav2/MoveIt2 goals, or just stop issuing
-   new ones?
+```python
+tcs = last.tool_calls or []
+if not tcs:                                          → "finish"
+elif all(tc["name"] == "ask_user" for tc in tcs):    → "ask_user"
+else:                                                → "exec_tool"
+```
+
+The mixed case (`ask_user` + other tools in the same turn) goes through
+`exec_tool` — that node runs **all** tool calls (including any `ask_user`
+mixed in), because Groq's tool-calling API requires every assistant
+`tool_call.id` to be answered before the next `think` iteration. Splitting the
+batch across nodes would break that invariant.
+
+---
+
+## Tools available to the LLM
+
+Each tool is defined in [agent/agent.py](agent.py) as a `@tool`-decorated thin
+shim, forwarding to [agent/tools.py](tools.py)'s `DISPATCH` (which respects the
+`IS_TEST_RUN` gate and the ROS singleton).
+
+| Tool | What it does | Backed by |
+|---|---|---|
+| `scan_scene()` | YOLO on latest RGB frame; ground-plane projection to `map` xyz | real ROS via `agent_node.scan_scene` |
+| `navigate_to(x, y)` | Send a `NavigateToPose` goal to Nav2 in `map` frame | real ROS via Nav2 action client |
+| `check_nav_status()` | Poll the stored Nav2 goal handle | real ROS via Nav2 action client |
+| `pick_up(object_label)` | Plan + execute arm grasp | **stub — `NotImplementedError`** |
+| `ask_user(question)` | Publish on `/agent/question`, block until `/agent/answer` | real ROS via the outer ring's pub/sub |
+
+`navigate_to` returns immediately with `status:"active"`; the LLM polls
+completion via `check_nav_status()`.
+
+---
+
+## Where ROS shows up
+
+The graph itself is pure Python — every ROS interaction is hidden inside the
+tool dispatch. So:
+
+- The graph can run in `IS_TEST_RUN=1` (canned data, no ROS) for laptop dev.
+- The graph can run inside `agent_node` (full ROS via the singleton).
+- Switching simulators (Gazebo → Unity) only touches the agent_node side and
+  the launch files; `agent.py` is untouched.
+
+---
+
+## Knobs
+
+| Env var | Effect | Default |
+|---|---|---|
+| `GROQ_API_KEY` | Groq auth | required |
+| `AIR_LLM_ENABLED` | Outer ring runs the graph (`1`) or the scan-only loop (`0`) | `1` |
+| `AIR_LLM_DEBUG` | Inside `think_node`, log full request + response bodies | `0` |
+| `IS_TEST_RUN` | `agent_tools.DISPATCH` returns canned data instead of hitting ROS | `0` |
+
+See [../md/check.md](../md/check.md) for the full reference.
+
+---
+
+## What changed from the previous design
+
+Earlier sketch (in this file's git history) had a *router* upfront that classified
+each user turn as `communication` vs `navigation` vs `manipulation` and
+dispatched to one of two loops. We collapsed that to a single LangGraph because:
+
+- Groq's tool-calling already handles the "should I call a tool?" decision
+  (it routes to `finish` when no tool call is needed — that *is* the
+  conversational case).
+- A separate router would be one extra LLM call per turn, no behavioural win.
+- The "communication ⇄ action" jump is now just an `ask_user` tool call — no
+  classifier, no two-loop bookkeeping.
+
+If we ever want a true planning/decomposition step (the *"plan → think →
+verify"* pattern), it'd slot in as a new node before `think` — easy add to the
+graph, no architectural surgery.
