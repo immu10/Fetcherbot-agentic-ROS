@@ -50,8 +50,10 @@ from langgraph.graph import END, StateGraph
 
 try:
     from . import tools as agent_tools          # `python -m agent.agent`
+    from .prompts import SYSTEM_PROMPT
 except ImportError:
     import tools as agent_tools                 # `python agent/agent.py`
+    from prompts import SYSTEM_PROMPT
 
 # Load .env from the project root (one dir above this file).
 load_dotenv(os.path.join(os.path.dirname(__file__), os.pardir, ".env"))
@@ -68,19 +70,7 @@ _log = logging.getLogger("air")
 # AIR_LLM_DEBUG=1 dumps full request + response bodies to the log file.
 _LLM_DEBUG = os.environ.get("AIR_LLM_DEBUG") == "1"
 
-SYSTEM_PROMPT = """You are the brain of a mobile manipulator robot.
-
-You receive a voice command from a user and must complete the task by calling
-the tools available to you. You can scan the scene, navigate, pick up objects,
-and ask the user clarifying questions.
-
-Reasoning guidelines:
-- Always scan the scene before navigating or picking up.
-- If multiple objects match, pick the closest or ask the user.
-- If navigation fails, try a different approach angle before giving up.
-- If pick up fails, retry once, then ask the user.
-- When the task is complete, respond with a short confirmation to the user.
-"""
+# SYSTEM_PROMPT is imported from agent.prompts.
 
 
 # ---------- LangChain tool wrappers ----------

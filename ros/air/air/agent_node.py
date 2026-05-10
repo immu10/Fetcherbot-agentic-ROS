@@ -583,6 +583,7 @@ class AgentNode(Node):
         """
         try:
             from agent.agent import run as run_agent
+            from agent.prompts import INTERACTIVE_PROMPT
         except Exception as e:
             err = f"could not import agent.agent.run ({type(e).__name__}: {e}); the LLM loop is disabled. Node will idle."
             self.get_logger().error(err)
@@ -593,7 +594,7 @@ class AgentNode(Node):
         self.get_logger().info("interactive loop ready — awaiting first command.")
         _air_log.info("interactive loop ready.")
         while rclpy.ok():
-            ask = self.ask_user("What would you like me to do? (type 'quit' to exit)")
+            ask = self.ask_user(INTERACTIVE_PROMPT)
             if "error" in ask:
                 # Most likely an ask_timeout. Loop and re-prompt so the user
                 # has another chance instead of dying silently.
