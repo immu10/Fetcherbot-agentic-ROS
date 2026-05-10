@@ -347,61 +347,63 @@ class AgentNode(Node):
 
         return {"detections": detections}
 
-    def look_around(
-        self,
-        num_scans: int = 8,
-        scan_period_s: float = 1.5,
-        angular_speed_rad_s: float = 0.6,
-    ) -> dict:
-        """Spin in place while scanning periodically; return merged detections.
-
-        Default: 8 scans across one full rotation (~13 s). Useful when the LLM
-        is asked "what do you see" and a single forward scan misses things off
-        to the sides — also helps with low-confidence detections by giving
-        YOLO multiple shots at each object from slightly different angles.
-
-        Detections are deduplicated by (label, position rounded to 10 cm). The
-        first sighting wins (we keep its bbox + confidence).
-
-        Returns:
-            {"detections": [...], "scans_done": N}
-        """
-        twist = Twist()
-        twist.angular.z = float(angular_speed_rad_s)
-        stop = Twist()  # zero by default
-
-        merged: list[dict] = []
-        seen: set = set()
-
-        try:
-            for _ in range(num_scans):
-                # Drive rotation for one scan period before scanning. Publishing
-                # cmd_vel at ~10 Hz keeps the diff_drive plugin happy (it
-                # otherwise stops the bot if it stops hearing commands).
-                end = time.time() + scan_period_s
-                while time.time() < end:
-                    self._cmd_vel_pub.publish(twist)
-                    time.sleep(0.1)
-
-                snap = self.scan_scene()
-                for det in snap.get("detections", []):
-                    pos = det.get("position") or {}
-                    key = (
-                        det.get("label"),
-                        round(pos.get("x", 0.0), 1),
-                        round(pos.get("y", 0.0), 1),
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(det)
-        finally:
-            # Always stop the bot on exit, even if scan_scene threw.
-            for _ in range(3):
-                self._cmd_vel_pub.publish(stop)
-                time.sleep(0.05)
-
-        return {"detections": merged, "scans_done": num_scans}
+    # DISABLED — broke things in testing. Re-enable by uncommenting and adding
+    # `look_around` back into agent/tools.py DISPATCH and agent/agent.py TOOLS.
+    # def look_around(
+    #     self,
+    #     num_scans: int = 8,
+    #     scan_period_s: float = 1.5,
+    #     angular_speed_rad_s: float = 0.6,
+    # ) -> dict:
+    #     """Spin in place while scanning periodically; return merged detections.
+    #
+    #     Default: 8 scans across one full rotation (~13 s). Useful when the LLM
+    #     is asked "what do you see" and a single forward scan misses things off
+    #     to the sides — also helps with low-confidence detections by giving
+    #     YOLO multiple shots at each object from slightly different angles.
+    #
+    #     Detections are deduplicated by (label, position rounded to 10 cm). The
+    #     first sighting wins (we keep its bbox + confidence).
+    #
+    #     Returns:
+    #         {"detections": [...], "scans_done": N}
+    #     """
+    #     twist = Twist()
+    #     twist.angular.z = float(angular_speed_rad_s)
+    #     stop = Twist()  # zero by default
+    #
+    #     merged: list[dict] = []
+    #     seen: set = set()
+    #
+    #     try:
+    #         for _ in range(num_scans):
+    #             # Drive rotation for one scan period before scanning. Publishing
+    #             # cmd_vel at ~10 Hz keeps the diff_drive plugin happy (it
+    #             # otherwise stops the bot if it stops hearing commands).
+    #             end = time.time() + scan_period_s
+    #             while time.time() < end:
+    #                 self._cmd_vel_pub.publish(twist)
+    #                 time.sleep(0.1)
+    #
+    #             snap = self.scan_scene()
+    #             for det in snap.get("detections", []):
+    #                 pos = det.get("position") or {}
+    #                 key = (
+    #                     det.get("label"),
+    #                     round(pos.get("x", 0.0), 1),
+    #                     round(pos.get("y", 0.0), 1),
+    #                 )
+    #                 if key in seen:
+    #                     continue
+    #                 seen.add(key)
+    #                 merged.append(det)
+    #     finally:
+    #         # Always stop the bot on exit, even if scan_scene threw.
+    #         for _ in range(3):
+    #             self._cmd_vel_pub.publish(stop)
+    #             time.sleep(0.05)
+    #
+    #     return {"detections": merged, "scans_done": num_scans}
 
     def _pixel_to_camera_xyz(
         self,

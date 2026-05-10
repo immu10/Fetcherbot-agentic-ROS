@@ -42,10 +42,11 @@ def scan_scene() -> dict:
     return _node().scan_scene()
 
 
-def look_around() -> dict:
-    if IS_TEST_RUN:
-        return _FAKE_SCENE  # same canned scene; test path doesn't move the bot
-    return _node().look_around()
+# DISABLED — see agent/agent.py for re-enable steps.
+# def look_around() -> dict:
+#     if IS_TEST_RUN:
+#         return _FAKE_SCENE  # same canned scene; test path doesn't move the bot
+#     return _node().look_around()
 
 
 def navigate_to(x: float, y: float) -> dict:
@@ -148,7 +149,7 @@ TOOLS = [
 
 DISPATCH = {
     "scan_scene": lambda **_: scan_scene(),
-    "look_around": lambda **_: look_around(),
+    # "look_around": lambda **_: look_around(),  # DISABLED
     "navigate_to": lambda **kw: navigate_to(**kw),
     "approach": lambda **kw: approach(**kw),
     "check_nav_status": lambda **_: check_nav_status(),

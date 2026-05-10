@@ -90,18 +90,20 @@ def scan_scene() -> str:
     return json.dumps(agent_tools.scan_scene())
 
 
-@tool
-def look_around() -> str:
-    """Spin the robot in place 360°, scanning periodically; return merged
-    detections from all viewpoints.
-
-    Use this when asked open-ended questions like "what do you see?" or when
-    a single scan_scene() returned nothing — the object you're looking for
-    might be off to the side. Takes ~13 seconds. Detections are deduplicated
-    by label + position, so the same object seen from multiple angles
-    appears once.
-    """
-    return json.dumps(agent_tools.look_around())
+# DISABLED — broke things in testing. Re-enable by uncommenting and adding
+# `look_around` back into TOOLS below.
+# @tool
+# def look_around() -> str:
+#     """Spin the robot in place 360°, scanning periodically; return merged
+#     detections from all viewpoints.
+#
+#     Use this when asked open-ended questions like "what do you see?" or when
+#     a single scan_scene() returned nothing — the object you're looking for
+#     might be off to the side. Takes ~13 seconds. Detections are deduplicated
+#     by label + position, so the same object seen from multiple angles
+#     appears once.
+#     """
+#     return json.dumps(agent_tools.look_around())
 
 
 @tool
@@ -145,7 +147,8 @@ def ask_user(question: str) -> str:
     return json.dumps(agent_tools.ask_user(question=question))
 
 
-TOOLS = [scan_scene, look_around, navigate_to, approach, check_nav_status, pick_up, ask_user]
+TOOLS = [scan_scene, navigate_to, approach, check_nav_status, pick_up, ask_user]
+# look_around removed — re-add to this list (and uncomment its @tool above) to enable.
 
 
 # ---------- LLM ----------
