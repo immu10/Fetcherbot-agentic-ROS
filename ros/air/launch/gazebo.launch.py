@@ -127,7 +127,16 @@ def generate_launch_description():
     #    We deliberately do NOT use turtlebot3_manipulation_navigation2's
     #    navigation2.launch.py — that one expects a saved map file path and
     #    blows up with "No such file or directory: ''" if you don't pass one.
-    #    For live-SLAM workflows the bringup variant is the right pick.
+    #
+    #    `params_file` MUST be passed explicitly: nav2_bringup's launch
+    #    declares it with a sensible default, but DeclareLaunchArgument
+    #    defaults don't propagate through IncludeLaunchDescription on Humble —
+    #    so the inner LaunchConfiguration('params_file') resolves to '' and
+    #    rewritten_yaml.py crashes with FileNotFoundError on open(''). The
+    #    PathJoinSubstitution below is the canonical default upstream uses.
+    nav2_params_file = PathJoinSubstitution([
+        FindPackageShare("nav2_bringup"), "params", "nav2_params.yaml",
+    ])
     nav2_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -135,7 +144,11 @@ def generate_launch_description():
                 "launch", "navigation_launch.py",
             ])
         ),
-        launch_arguments={"use_sim_time": "true"}.items(),
+        launch_arguments={
+            "use_sim_time": "true",
+            "params_file": nav2_params_file,
+            "autostart":   "true",
+        }.items(),
     )
     delayed_nav2 = TimerAction(period=8.0, actions=[nav2_launch])
 
