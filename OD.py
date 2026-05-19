@@ -31,6 +31,50 @@ def detect_frame(model: YOLO, frame):
     return results[0], results[0].plot()
 
 
+def extract_detections(result) -> list[dict]:
+    """Pull a clean per-detection dict list out of an ultralytics Results object.
+
+    Returns:
+        [
+            {
+                "label":      "cup",
+                "confidence": 0.87,
+                "bbox":       [x1, y1, x2, y2],   # pixel coords
+                "center":     [cx, cy],           # pixel center, convenience
+                "cls_id":     41,
+            },
+            ...
+        ]
+        Empty list if no detections.
+
+    Keeps all ultralytics-specific shape-juggling (boxes.xyxy.cpu().numpy(),
+    names dict vs list, cls_id → label lookup) on THIS side so callers don't
+    need to know YOLO internals. Pair with your own projection / drawing /
+    filtering code on top.
+    """
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    xyxy  = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    clss  = boxes.cls.cpu().numpy().astype(int)
+    names = result.names  # dict[int, str] in modern ultralytics; list in old.
+
+    out = []
+    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
+        cls_id = int(cls_id)
+        label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else names[cls_id]
+        out.append({
+            "label":      label,
+            "confidence": float(conf),
+            "bbox":       [float(x1), float(y1), float(x2), float(y2)],
+            "center":     [int((x1 + x2) / 2), int((y1 + y2) / 2)],
+            "cls_id":     cls_id,
+        })
+    return out
+
+
 def run_on_source(model: YOLO, source, window_name: str = "YOLO11"):
     """Generic loop over any cv2.VideoCapture-compatible source.
     `source` can be an int (webcam index), a video path, or an RTSP/HTTP URL.

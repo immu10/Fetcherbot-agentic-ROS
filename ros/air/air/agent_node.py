@@ -376,36 +376,27 @@ class AgentNode(Node):
         if rgb is None:
             return {"error": f"no RGB frame received yet on {RGB_TOPIC}."}
 
+        # YOLO inference + per-detection extraction live in OD.py — agent_node
+        # only adds the ROS-specific bit (project pixel → map frame via tf).
         try:
             result, _ = OD.detect_frame(self._yolo, rgb)
+            raw = OD.extract_detections(result)
         except Exception as e:
             return {"error": f"YOLO inference failed: {type(e).__name__}: {e}"}
 
-        names = result.names  # class_id -> label
-        detections = []
-
-        # ultralytics Results — boxes is None when nothing detected.
-        boxes = getattr(result, "boxes", None)
-        if boxes is None or len(boxes) == 0:
+        if not raw:
             return {"detections": []}
 
-        xyxy  = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        clss  = boxes.cls.cpu().numpy().astype(int)
-
-        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            label = names.get(int(cls_id), str(cls_id)) if isinstance(names, dict) else names[int(cls_id)]
-
+        detections = []
+        for d in raw:
+            cx, cy = d["center"]
             position = self._project_to_ground(cx, cy, cam_model, cam_frame, "map")
-
             detections.append({
-                "label": label,
-                "confidence": float(conf),
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "position": position,            # {x,y,z=0} in map frame, or None
-                "frame_id": "map",
+                "label":      d["label"],
+                "confidence": d["confidence"],
+                "bbox":       d["bbox"],
+                "position":   position,        # {x,y,z=0} in map frame, or None
+                "frame_id":   "map",
             })
 
         return {"detections": detections}
