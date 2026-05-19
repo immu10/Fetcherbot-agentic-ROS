@@ -93,6 +93,43 @@ _MARKER_SDF = """<?xml version="1.0"?>
 """
 
 
+def _patched_nav2_params() -> str:
+    """Copy nav2_bringup's nav2_params.yaml to /tmp with `allow_unknown: true`
+    flipped on for the global planner. Returns the patched file's path.
+
+    Why patch instead of vendoring: the upstream YAML is ~500 lines and tracks
+    nav2 versions; vendoring means we drift. Patching keeps us aligned with
+    whatever the installed nav2_bringup version ships, and only the bits we
+    actually care about (a single string substitution).
+
+    `allow_unknown: true` lets NavfnPlanner plan paths through cells SLAM
+    hasn't seen yet — bot drives into unexplored space, SLAM fills in as it
+    goes. Without this, "go to the kitchen" fails until the kitchen has been
+    mapped by manual teleop.
+    """
+    from ament_index_python.packages import get_package_share_directory
+    src = os.path.join(
+        get_package_share_directory("nav2_bringup"),
+        "params", "nav2_params.yaml",
+    )
+    with open(src, "r") as f:
+        text = f.read()
+
+    # The planner_server -> GridBased plugin block sets `allow_unknown: false`
+    # on Humble. Flip every occurrence to be safe (the controller also has a
+    # similar key but it's harmless to flip there too).
+    patched = text.replace("allow_unknown: false", "allow_unknown: true")
+    if "allow_unknown" not in patched:
+        # Upstream changed the key name or removed the default — bail out and
+        # use the file as-is rather than silently doing nothing.
+        return src
+
+    out = os.path.join(tempfile.gettempdir(), "air_nav2_params.yaml")
+    with open(out, "w") as f:
+        f.write(patched)
+    return out
+
+
 def _spawn_checkpoint_marker(name: str, x: float, y: float):
     """Write the no-collision SDF to /tmp and spawn it via gazebo_ros.
     Using -file (not -string) because the apt-installed spawn_entity.py on
@@ -221,13 +258,12 @@ def generate_launch_description():
     #
     #    `params_file` MUST be passed explicitly: nav2_bringup's launch
     #    declares it with a sensible default, but DeclareLaunchArgument
-    #    defaults don't propagate through IncludeLaunchDescription on Humble —
-    #    so the inner LaunchConfiguration('params_file') resolves to '' and
-    #    rewritten_yaml.py crashes with FileNotFoundError on open(''). The
-    #    PathJoinSubstitution below is the canonical default upstream uses.
-    nav2_params_file = PathJoinSubstitution([
-        FindPackageShare("nav2_bringup"), "params", "nav2_params.yaml",
-    ])
+    #    defaults don't propagate through IncludeLaunchDescription on Humble.
+    #    Instead of pointing at the upstream file as-is, we patch it at launch
+    #    time to enable `allow_unknown` — lets the planner route through cells
+    #    SLAM hasn't mapped yet, so "go to the kitchen" succeeds even when
+    #    half the room is still unexplored.
+    nav2_params_file = _patched_nav2_params()
     nav2_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
