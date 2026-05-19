@@ -217,9 +217,9 @@ def generate_launch_description():
     #    can't reach its database, swap to local SDFs (see git history) or use
     #    Ignition Fuel `<include><uri>https://fuel...</uri></include>`.
     spawns = [
-        _spawn_db("coke",  "coke_can",     x=0.45, y=-0.45,  z=0.05),
+        _spawn_db("coke",  "coke_can",     x=0.45, y=-0.15,  z=0.05),
         _spawn_db("cup",   "plastic_cup",  x=0.45, y=-0.30,  z=0.05),
-        _spawn_db("ball",  "cricket_ball", x=0.45, y=-0.15, z=0.05),
+        _spawn_db("ball",  "cricket_ball", x=0.45, y=-0.45, z=0.05),
     ]
 
     # Gazebo + ros2_control + URDF parsing takes a few seconds. Spawning objects
