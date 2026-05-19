@@ -49,7 +49,7 @@ def scan_scene() -> dict:
 #     return _node().look_around()
 
 
-def navigate_to(points: list) -> dict:
+def navigate_to(points: list, stop_distance: float = 0.0) -> dict:
     if IS_TEST_RUN:
         if not points:
             return {"status": "failed", "reason": "navigate_to: empty points list"}
@@ -58,8 +58,8 @@ def navigate_to(points: list) -> dict:
         if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
             return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
         set_phase("navigating")  # mirror real-mode transition (agent_node does this)
-        return {"status": "active", "target": {"x": x, "y": y}}
-    return _node().navigate_to(points)
+        return {"status": "active", "target": {"x": x, "y": y}, "stop_distance": stop_distance}
+    return _node().navigate_to(points, stop_distance=stop_distance)
 
 
 # DISABLED — see agent/agent.py for re-enable steps.

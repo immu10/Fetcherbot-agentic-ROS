@@ -578,21 +578,22 @@ class AgentNode(Node):
             return None  # ray points away from / above ground
         return {"x": float(ox + s * rx), "y": float(oy + s * ry), "z": 0.0}
 
-    def navigate_to(self, points: list) -> dict:
+    def navigate_to(self, points: list, stop_distance: float = 0.0) -> dict:
         """Send a NavigateToPose goal in `map` frame; return immediately.
 
         `points` is a list of [x, y] pairs. For now we only use points[0]
-        (the primary target) — the bisect-retry logic below still handles
-        fallbacks at fractions 0.5, 0.25, 0.125 along bot→goal automatically.
+        (the primary target) — the bisect-retry logic still handles fallbacks
+        at fractions 0.5, 0.25, 0.125 along bot→goal automatically.
         Multi-waypoint chains can be wired up later by iterating `points`.
 
-        On failure, _on_nav_done auto-retries at points closer to the bot.
-        Useful when the original goal is outside the mapped costmap area —
-        bisect lands somewhere reachable instead of giving up. LLM only sees
-        the final outcome.
+        `stop_distance` (metres): if > 0, back the target off along the
+        bot→target line by this much. Use when the goal is an object you want
+        to be NEAR, not ON — e.g. stop_distance=0.20 lands the bot ~20 cm from
+        the ball instead of driving over it. For checkpoint-style "land on
+        this exact point" navigation, leave at 0.
 
-        The LLM observes completion via check_nav_status(wait_seconds=N) or
-        a nav_done event on the outer-ring queue. No polling.
+        On failure, _on_nav_done auto-retries at points closer to the bot.
+        LLM only sees the final outcome.
         """
         if not points:
             return {"status": "failed", "reason": "navigate_to: empty points list"}
@@ -602,6 +603,46 @@ class AgentNode(Node):
                 f"navigate_to: {len(points)} points given, using points[0]=({x:.2f},{y:.2f}); "
                 "multi-waypoint not wired yet"
             )
+
+        # stop_distance: pull the goal back toward the bot's current pose.
+        # If we can't get the pose (tf timeout), skip the adjustment rather
+        # than fail the whole nav — losing 20cm of precision is better than
+        # not driving at all.
+        if stop_distance > 0:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    "map", "base_footprint", rclpy.time.Time(),
+                    timeout=Duration(seconds=0.5),
+                )
+                rx, ry = t.transform.translation.x, t.transform.translation.y
+                dx, dy = x - rx, y - ry
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > stop_distance:
+                    scale = (dist - stop_distance) / dist
+                    x_adj = rx + dx * scale
+                    y_adj = ry + dy * scale
+                    self.get_logger().info(
+                        f"navigate_to: stop_distance={stop_distance:.2f}m → "
+                        f"({x:.2f},{y:.2f}) adjusted to ({x_adj:.2f},{y_adj:.2f})"
+                    )
+                    x, y = x_adj, y_adj
+                else:
+                    self.get_logger().info(
+                        f"navigate_to: already within stop_distance ({dist:.2f}m); "
+                        "treating as no-op success"
+                    )
+                    # Synthesize a succeeded result via the same channel so the
+                    # outer ring's nav_done event fires consistently.
+                    self.set_phase("navigating")
+                    self._nav_original_goal = (float(x), float(y))
+                    self._nav_attempt = 0
+                    self._nav_attempt_kind = "target"
+                    self._finalize_nav("succeeded")
+                    return {"status": "active", "target": {"x": float(x), "y": float(y)}}
+            except Exception as e:
+                self.get_logger().warn(
+                    f"navigate_to: stop_distance tf lookup failed ({e}); using raw goal"
+                )
 
         self._nav_original_goal = (float(x), float(y))
         self._nav_attempt = 0
@@ -771,49 +812,8 @@ class AgentNode(Node):
             self.get_logger().info(f"phase: {prev} → {phase}")
             _air_log.info(f"phase: {prev} → {phase}")
 
-    def approach(self, x: float, y: float, stop_distance: float = 0.30) -> dict:
-        """Drive toward (x, y) but stop `stop_distance` metres short.
-
-        Two-stage detection workflow: a low-confidence YOLO hit gives the LLM
-        a rough xy. Calling approach() with that xy gets the bot close enough
-        to scan_scene() again at high confidence — without overshooting and
-        running into the object.
-
-        Implementation: look up current robot pose in map frame, compute the
-        unit vector from bot → target, back off `stop_distance` along that
-        vector, then call navigate_to() with the resulting "stop point".
-        Returns the same dict shape as navigate_to().
-        """
-        try:
-            t = self._tf_buffer.lookup_transform(
-                "map", "base_footprint",
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.5),
-            )
-        except Exception as e:
-            return {"status": "failed", "reason": f"tf lookup map<-base_footprint failed: {e}"}
-
-        rx = t.transform.translation.x
-        ry = t.transform.translation.y
-        dx = float(x) - rx
-        dy = float(y) - ry
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        if dist <= stop_distance:
-            return {
-                "status": "succeeded",
-                "reason": f"already within {stop_distance:.2f}m of ({x:.2f}, {y:.2f}) — distance was {dist:.2f}m",
-            }
-
-        # Walk back from the target toward the bot by stop_distance.
-        scale = (dist - stop_distance) / dist
-        tx = rx + dx * scale
-        ty = ry + dy * scale
-        self.get_logger().info(
-            f"approach: bot=({rx:.2f},{ry:.2f}) target=({x:.2f},{y:.2f}) "
-            f"→ stop=({tx:.2f},{ty:.2f}) (was {dist:.2f}m, stop {stop_distance:.2f}m)"
-        )
-        return self.navigate_to([[tx, ty]])
+    # approach() was merged into navigate_to(stop_distance=...) — see that
+    # method. To restore the standalone tool, copy from git history.
 
     def list_checkpoints(self) -> dict:
         """Return all named checkpoints the bot knows about.

@@ -107,17 +107,22 @@ def scan_scene() -> str:
 
 
 @tool
-def navigate_to(points: list) -> str:
+def navigate_to(points: list, stop_distance: float = 0.0) -> str:
     """Drive the robot base in map frame. `points` is a list of [x, y] pairs.
 
     For a single destination, pass [[x, y]]. Currently only the primary target
     (points[0]) is used; the rest are reserved for future multi-waypoint
     routing — pass them anyway if you have a plan in mind.
 
+    `stop_distance` (metres): if > 0, stop that far short of the goal along
+    the bot→goal line. Use ~0.20 when navigating TO an object you want to
+    pick up — keeps the bot adjacent instead of driving over it. Leave 0
+    (default) for "land exactly here" cases like checkpoint navigation.
+
     Returns a JSON status; status:'active' means the goal was accepted — your
     turn ends, you'll be re-invoked when nav completes (do NOT poll).
     """
-    return json.dumps(agent_tools.navigate_to(points=points))
+    return json.dumps(agent_tools.navigate_to(points=points, stop_distance=stop_distance))
 
 
 # DISABLED — re-enable by uncommenting and adding `approach` back into
