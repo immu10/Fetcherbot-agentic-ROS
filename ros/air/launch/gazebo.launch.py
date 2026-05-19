@@ -290,18 +290,23 @@ def generate_launch_description():
     #     path, the local plan, and the bot's footprint. Lets you see exactly
     #     where the planner is trying to route and where the controller bails
     #     out. Comes free with nav2_bringup; no need to vendor a config.
-    rviz_config = PathJoinSubstitution([
-        FindPackageShare("nav2_bringup"), "rviz", "nav2_default_view.rviz",
-    ])
-    rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        output="screen",
-        arguments=["-d", rviz_config],
-        parameters=[{"use_sim_time": True}],
-    )
-    delayed_rviz = TimerAction(period=10.0, actions=[rviz_node])
+    #
+    #     Opt-in via AIR_RVIZ=1 in your .env / shell. Default off because
+    #     WSL needs WSLg or an X server set up — silent failure otherwise.
+    rviz_enabled = os.environ.get("AIR_RVIZ", "0") == "1"
+    if rviz_enabled:
+        rviz_config = PathJoinSubstitution([
+            FindPackageShare("nav2_bringup"), "rviz", "nav2_default_view.rviz",
+        ])
+        rviz_node = Node(
+            package="rviz2",
+            executable="rviz2",
+            name="rviz2",
+            output="screen",
+            arguments=["-d", rviz_config],
+            parameters=[{"use_sim_time": True}],
+        )
+        delayed_rviz = TimerAction(period=10.0, actions=[rviz_node])
 
     # 5) Our agent_node. Pulled from the existing launch file so we don't
     #    duplicate its parameters here — single source of truth.
@@ -332,6 +337,6 @@ def generate_launch_description():
         delayed_checkpoints,
         delayed_slam,
         delayed_nav2,
-        delayed_rviz,
         delayed_agent,
+        *([delayed_rviz] if rviz_enabled else []),
     ])
