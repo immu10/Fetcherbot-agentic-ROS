@@ -45,6 +45,9 @@ from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
+from control_msgs.action import FollowJointTrajectory, GripperCommand
+from trajectory_msgs.msg import JointTrajectoryPoint
+from builtin_interfaces.msg import Duration as DurationMsg
 from cv_bridge import CvBridge
 from image_geometry import PinholeCameraModel
 from tf2_ros import Buffer, TransformListener
@@ -283,6 +286,22 @@ class AgentNode(Node):
         # sets this event. check_nav_status(wait_seconds=N) blocks on it instead
         # of polling — one Groq call per drive instead of ~20.
         self._nav_done_event = threading.Event()
+
+        # ---- arm + gripper action clients ----
+        # These reach the controllers brought up by ros2_control. Action names
+        # match what `ros2 action list` showed:
+        #   /arm_controller/follow_joint_trajectory  (FollowJointTrajectory)
+        #   /gripper_controller/gripper_cmd          (GripperCommand)
+        self._arm_client = ActionClient(
+            self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory",
+        )
+        self._gripper_client = ActionClient(
+            self, GripperCommand, "/gripper_controller/gripper_cmd",
+        )
+
+        # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
+        # them under these names. Update if your URDF differs.
+        self._arm_joint_names = ["joint1", "joint2", "joint3", "joint4"]
 
         # Incremental-nav state. On a failure, fire a midpoint between current
         # pose and the real target — that drive grows the SLAM map. After the
@@ -906,8 +925,103 @@ class AgentNode(Node):
             return {"status": "canceled"}
         return {"status": "failed"}  # aborted / unknown / anything else terminal
 
-    def pick_up(self, object_label: str) -> dict:
-        raise NotImplementedError("pick_up: wire to MoveIt2 MoveGroup + GripperCommand.")
+    def pick_up(self, object_label: str = "object") -> dict:
+        """Scripted-pose pickup. Sends a fixed arm trajectory + closes gripper.
+
+        No IK / MoveIt — pick_up is a canned routine assuming the object is on
+        the floor ~15 cm ahead of the bot. Sequence:
+          1. Move arm to a pre-grasp pose (extended forward, low).
+          2. Open gripper.
+          3. Lower the wrist to the floor.
+          4. Close gripper.
+          5. Lift back to a stow pose.
+
+        Returns {"status": "success"} / {"status": "failed", "reason": ...}.
+        Replace with IK-driven planning once MoveGroup is wired up.
+        """
+        self.get_logger().info(f"pick_up: scripted routine for {object_label!r}")
+
+        # Joint poses (joint1..4) in radians. Tuned for OpenManipulator-X
+        # reaching forward to a floor-level object directly in front of the bot.
+        # Adjust if the gripper isn't landing where you expect.
+        POSE_HOME      = [0.0,  0.0,  0.0,  0.0]
+        POSE_PRE_GRASP = [0.0,  0.8, -0.4, -0.4]   # extended low forward
+        POSE_GRASP     = [0.0,  1.3, -0.8, -0.5]   # wrist near floor
+        POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
+
+        if not self._arm_client.wait_for_server(timeout_sec=2.0):
+            return {"status": "failed", "reason": "arm action server unavailable"}
+        if not self._gripper_client.wait_for_server(timeout_sec=2.0):
+            return {"status": "failed", "reason": "gripper action server unavailable"}
+
+        try:
+            self._send_arm_pose(POSE_PRE_GRASP, duration_s=2.0)
+            self._send_gripper(0.019)                       # open (max ~0.019 rad)
+            self._send_arm_pose(POSE_GRASP, duration_s=1.5)
+            self._send_gripper(-0.01)                       # close on object
+            self._send_arm_pose(POSE_LIFT, duration_s=1.5)
+        except Exception as e:
+            return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
+
+        self.set_phase("holding")
+        return {"status": "success", "object": object_label}
+
+    def _send_arm_pose(self, positions: list, duration_s: float = 2.0) -> None:
+        """Blocking send of a single-waypoint joint trajectory.
+        Raises on rejection / failure so pick_up can short-circuit cleanly.
+        """
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(self._arm_joint_names)
+
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(p) for p in positions]
+        secs = int(duration_s)
+        nsecs = int((duration_s - secs) * 1e9)
+        pt.time_from_start = DurationMsg(sec=secs, nanosec=nsecs)
+        goal.trajectory.points = [pt]
+
+        self.get_logger().info(f"arm → {positions} over {duration_s}s")
+        send_fut = self._arm_client.send_goal_async(goal)
+        deadline = time.time() + 5.0
+        while not send_fut.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not send_fut.done():
+            raise RuntimeError("arm send_goal timed out")
+        handle = send_fut.result()
+        if handle is None or not handle.accepted:
+            raise RuntimeError("arm goal rejected")
+
+        # Wait for completion.
+        result_fut = handle.get_result_async()
+        deadline = time.time() + duration_s + 5.0
+        while not result_fut.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not result_fut.done():
+            raise RuntimeError("arm trajectory result timed out")
+
+    def _send_gripper(self, position: float) -> None:
+        """Blocking send to the gripper. position: ~+0.019 open, ~-0.01 closed."""
+        goal = GripperCommand.Goal()
+        goal.command.position = float(position)
+        goal.command.max_effort = 2.0
+
+        self.get_logger().info(f"gripper → {position}")
+        send_fut = self._gripper_client.send_goal_async(goal)
+        deadline = time.time() + 3.0
+        while not send_fut.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not send_fut.done():
+            raise RuntimeError("gripper send_goal timed out")
+        handle = send_fut.result()
+        if handle is None or not handle.accepted:
+            raise RuntimeError("gripper goal rejected")
+
+        result_fut = handle.get_result_async()
+        deadline = time.time() + 3.0
+        while not result_fut.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not result_fut.done():
+            raise RuntimeError("gripper result timed out")
 
     def ask_user(self, question: str) -> dict:
         """Publish a question, block until /agent/user comes back (or timeout).
@@ -952,9 +1066,24 @@ class AgentNode(Node):
 
         Used when AIR_LLM_ENABLED=0. Lets you verify the camera + YOLO path in
         isolation while you're still iterating on Gazebo models / lighting.
+
+        Also fires pick_up() once at startup so the arm trajectory can be
+        eyeballed without involving the LLM. Failure is logged but doesn't
+        crash the loop — sim might not have the arm controllers ready yet.
         """
         self.get_logger().info(f"scan-only loop (LLM disabled) — every {period_s}s.")
         _air_log.info(f"scan-only loop started (period={period_s}s)")
+
+        # One-shot arm-sweep test. Give the action servers a moment to come up.
+        time.sleep(2.0)
+        self.get_logger().info("scan-only: firing pick_up() once for arm test...")
+        try:
+            res = self.pick_up("test_object")
+            self.get_logger().info(f"scan-only: pick_up returned {res}")
+            _air_log.info(f"scan-only pick_up result: {res}")
+        except Exception as e:
+            self.get_logger().warn(f"scan-only: pick_up raised {type(e).__name__}: {e}")
+            _air_log.warning(f"scan-only pick_up exception: {e}")
         while rclpy.ok():
             result = self.scan_scene()
             if "error" in result:
