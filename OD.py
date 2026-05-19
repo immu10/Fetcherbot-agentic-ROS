@@ -19,6 +19,10 @@ CONF = 0.10  # Sim objects (Gazebo textures + sim lighting) score lower than
              # real-world photos. 0.35 was killing legit detections; bump back
              # up if you start seeing too many false positives.
 IOU = 0.5
+IMGSZ = 1280  # Inference resolution. Default 640; bumping to 1280 means small
+              # / far objects get 4x more pixels for YOLO to recognise. ~3x
+              # slower per scan but real-time on CPU is still well under 1s.
+              # Drop back to 640 if you start hitting latency issues.
 
 
 def load_model(path: str = MODEL_PATH) -> YOLO:
@@ -27,7 +31,7 @@ def load_model(path: str = MODEL_PATH) -> YOLO:
 
 def detect_frame(model: YOLO, frame):
     """Run detection on a single BGR frame. Returns (results, annotated_frame)."""
-    results = model.predict(frame, conf=CONF, iou=IOU, verbose=False)
+    results = model.predict(frame, conf=CONF, iou=IOU, imgsz=IMGSZ, verbose=False)
     return results[0], results[0].plot()
 
 
