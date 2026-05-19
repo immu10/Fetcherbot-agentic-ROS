@@ -62,11 +62,12 @@ def navigate_to(points: list) -> dict:
     return _node().navigate_to(points)
 
 
-def approach(x: float, y: float, stop_distance: float = 0.30) -> dict:
-    if IS_TEST_RUN:
-        set_phase("navigating")
-        return {"status": "active", "reason": f"approaching ({x}, {y}) within {stop_distance}m"}
-    return _node().approach(x, y, stop_distance)
+# DISABLED — see agent/agent.py for re-enable steps.
+# def approach(x: float, y: float, stop_distance: float = 0.30) -> dict:
+#     if IS_TEST_RUN:
+#         set_phase("navigating")
+#         return {"status": "active", "reason": f"approaching ({x}, {y}) within {stop_distance}m"}
+#     return _node().approach(x, y, stop_distance)
 
 
 def check_nav_status(wait_seconds: float = 60.0) -> dict:
@@ -205,7 +206,7 @@ DISPATCH = {
     "scan_scene": lambda **_: scan_scene(),
     # "look_around": lambda **_: look_around(),  # DISABLED
     "navigate_to": lambda **kw: navigate_to(**kw),
-    "approach": lambda **kw: approach(**kw),
+    # "approach": lambda **kw: approach(**kw),  # DISABLED
     "check_nav_status": lambda **kw: check_nav_status(**kw),
     "pick_up": lambda **kw: pick_up(**kw),
     "ask_user": lambda **kw: ask_user(**kw),

@@ -120,17 +120,19 @@ def navigate_to(points: list) -> str:
     return json.dumps(agent_tools.navigate_to(points=points))
 
 
-@tool
-def approach(x: float, y: float, stop_distance: float = 0.30) -> str:
-    """Drive toward (x, y) but stop `stop_distance` metres short.
-
-    Use this when you have a low-confidence detection and want to get close
-    enough to scan_scene() again confidently. After calling, poll
-    check_nav_status until 'succeeded', then re-scan to confirm.
-    Default stop_distance: 30 cm — close enough for high-confidence YOLO,
-    far enough to not collide.
-    """
-    return json.dumps(agent_tools.approach(x=x, y=y, stop_distance=stop_distance))
+# DISABLED — re-enable by uncommenting and adding `approach` back into
+# ALL_TOOLS + TOOLS_BY_PHASE below.
+# @tool
+# def approach(x: float, y: float, stop_distance: float = 0.30) -> str:
+#     """Drive toward (x, y) but stop `stop_distance` metres short.
+#
+#     Use this when you have a low-confidence detection and want to get close
+#     enough to scan_scene() again confidently. After calling, poll
+#     check_nav_status until 'succeeded', then re-scan to confirm.
+#     Default stop_distance: 30 cm — close enough for high-confidence YOLO,
+#     far enough to not collide.
+#     """
+#     return json.dumps(agent_tools.approach(x=x, y=y, stop_distance=stop_distance))
 
 
 @tool
@@ -188,10 +190,10 @@ def ask_user(question: str) -> str:
     return json.dumps(agent_tools.ask_user(question=question))
 
 
-ALL_TOOLS = [scan_scene, navigate_to, approach, check_nav_status, pick_up,
+ALL_TOOLS = [scan_scene, navigate_to, check_nav_status, pick_up,
              list_checkpoints, go_to_checkpoint, ask_user]
-# look_around removed — re-add to this list (and uncomment its @tool above) to enable.
-# release will join when Stage 3 wires it.
+# look_around + approach removed — re-add to this list (and uncomment their
+# @tool defs above) to enable. release will join when Stage 3 wires it.
 
 # ---------- phase → allowed tools ----------
 # Restricting the LLM's tool palette per phase kills whole classes of invalid
@@ -202,7 +204,7 @@ ALL_TOOLS = [scan_scene, navigate_to, approach, check_nav_status, pick_up,
 # in every phase. Restrictive on stateful/destructive ones.
 TOOLS_BY_PHASE: dict[str, set[str]] = {
     "idle": {
-        "scan_scene", "navigate_to", "approach", "go_to_checkpoint",
+        "scan_scene", "navigate_to", "go_to_checkpoint",
         "list_checkpoints", "pick_up", "ask_user",
     },
     "navigating": {
@@ -214,7 +216,7 @@ TOOLS_BY_PHASE: dict[str, set[str]] = {
     "holding": {
         # Holding an object: can navigate to drop-off, can't pick up another
         # thing. release (Stage 3) will land here once wired.
-        "scan_scene", "navigate_to", "approach", "go_to_checkpoint",
+        "scan_scene", "navigate_to", "go_to_checkpoint",
         "list_checkpoints", "ask_user",
     },
 }
@@ -222,7 +224,7 @@ TOOLS_BY_PHASE: dict[str, set[str]] = {
 # Tools that fire Nav2 — exec_tool flags the turn as "yielded" after running
 # any of these so the graph ends without another think round. The outer ring
 # then waits on the event queue for nav_done before re-invoking.
-NAV_FIRING_TOOLS = {"navigate_to", "approach", "go_to_checkpoint"}
+NAV_FIRING_TOOLS = {"navigate_to", "go_to_checkpoint"}
 
 
 # ---------- LLM ----------
