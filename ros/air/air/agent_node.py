@@ -284,14 +284,18 @@ class AgentNode(Node):
         # of polling — one Groq call per drive instead of ~20.
         self._nav_done_event = threading.Event()
 
-        # Bisect-retry state: if a goal fails because it's outside the mapped
-        # area / blocked, _on_nav_done re-fires at progressively closer points
-        # along the bot→goal line (0.5, 0.25, 0.125). LLM only sees the final
-        # result — no extra Groq calls. Reset on each user-initiated navigate_to.
+        # Incremental-nav state. On a failure, fire a midpoint between current
+        # pose and the real target — that drive grows the SLAM map. After the
+        # midpoint succeeds, retry the real target from the new position. Loop
+        # until target succeeds, midpoint also fails (truly stuck), or we hit
+        # _nav_max_attempts. LLM only sees the final result.
+        #
+        # _nav_attempt_kind:  "target" or "midpoint" — which kind of goal is in
+        #                     flight, so _on_nav_done knows what to do on result.
         self._nav_original_goal: Optional[tuple[float, float]] = None
-        self._nav_start_pose: Optional[tuple[float, float]] = None
+        self._nav_attempt_kind: str = "target"
         self._nav_attempt: int = 0
-        self._nav_max_attempts: int = 4  # 1.0, 0.5, 0.25, 0.125
+        self._nav_max_attempts: int = 8  # enough for ~4 target/midpoint cycles
 
         # ---- direct base velocity publisher ----
         # Used by look_around() to spin the bot in place. Bypasses Nav2 — fine
@@ -590,20 +594,10 @@ class AgentNode(Node):
                 f"navigate_to: {len(points)} points given, using points[0]=({x:.2f},{y:.2f}); "
                 "multi-waypoint not wired yet"
             )
-        # Snapshot bot pose so retries interpolate from a stable origin (not
-        # from wherever the bot drifted to during recovery behaviors).
-        try:
-            t = self._tf_buffer.lookup_transform(
-                "map", "base_footprint", rclpy.time.Time(),
-                timeout=Duration(seconds=0.5),
-            )
-            self._nav_start_pose = (t.transform.translation.x, t.transform.translation.y)
-        except Exception:
-            # Fallback: use (0, 0) so bisect at least heads toward origin.
-            self._nav_start_pose = (0.0, 0.0)
 
         self._nav_original_goal = (float(x), float(y))
         self._nav_attempt = 0
+        self._nav_attempt_kind = "target"
         return self._send_nav_goal(float(x), float(y))
 
     def _send_nav_goal(self, x: float, y: float) -> dict:
@@ -648,10 +642,18 @@ class AgentNode(Node):
         return {"status": "active", "target": {"x": float(x), "y": float(y)}}
 
     def _on_nav_done(self, future):
-        """Result-future callback: cache terminal status; either auto-retry
-        (bisect) or wake the outer ring with the final outcome.
+        """Result-future callback: drive the target/midpoint state machine.
 
-        Runs on the rclpy executor thread. Keep it cheap — no LLM, no I/O.
+        Logic:
+          - target  succeeded  → done (we reached the real goal).
+          - target  failed     → fire a midpoint (halfway between bot's CURRENT
+                                 pose and target). That short drive grows the
+                                 SLAM map.
+          - midpoint succeeded → re-fire the target from new position; the map
+                                 has expanded, target may now be reachable.
+          - midpoint failed    → bot can't even make the easier midpoint; give
+                                 up to avoid an infinite loop.
+          - attempts hit cap   → give up regardless.
         """
         try:
             result = future.result()
@@ -662,38 +664,76 @@ class AgentNode(Node):
 
         self._nav_last_status = status
         self._nav_goal_handle = None
-
-        # Succeeded / canceled → just report. Bisect only applies to failures
-        # (typical cause: goal off the global costmap, planner can't even start).
         status_str = self._format_nav_status(status).get("status", "unknown")
-        if status != GoalStatus.STATUS_ABORTED:
+        kind = self._nav_attempt_kind
+
+        # Canceled is terminal — user/system stopped us, don't retry.
+        if status == GoalStatus.STATUS_CANCELED:
             self._finalize_nav(status_str)
             return
 
-        # Try the next bisect fraction if we have attempts left.
+        succeeded = (status == GoalStatus.STATUS_SUCCEEDED)
+
+        # Cap to avoid infinite loops if every step keeps failing in a way we
+        # haven't anticipated. Catches pathological worlds; normal cases finish
+        # well under this.
         self._nav_attempt += 1
-        if (self._nav_attempt < self._nav_max_attempts
-                and self._nav_original_goal is not None
-                and self._nav_start_pose is not None):
-            fraction = 0.5 ** self._nav_attempt  # 0.5, 0.25, 0.125
-            sx, sy = self._nav_start_pose
-            gx, gy = self._nav_original_goal
-            new_x = sx + (gx - sx) * fraction
-            new_y = sy + (gy - sy) * fraction
-            msg = (f"_on_nav_done: failed at ({gx:.2f},{gy:.2f}); "
-                   f"retrying at fraction={fraction} → ({new_x:.2f},{new_y:.2f})")
-            self.get_logger().info(msg)
-            _air_log.info(msg)
-            # Fire-and-forget — the new attempt's _on_nav_done will eventually
-            # call _finalize_nav with whatever result it gets.
-            self._send_nav_goal(new_x, new_y)
+        if self._nav_attempt >= self._nav_max_attempts:
+            msg = f"_on_nav_done: max attempts ({self._nav_max_attempts}) reached; giving up"
+            self.get_logger().info(msg); _air_log.info(msg)
+            self._finalize_nav(status_str if succeeded else "failed")
             return
 
-        # All retries exhausted.
-        self.get_logger().info(
-            f"_on_nav_done: failed after {self._nav_attempt} attempts; giving up"
-        )
-        self._finalize_nav(status_str)
+        if self._nav_original_goal is None:
+            # Should not happen — finalize defensively.
+            self._finalize_nav(status_str)
+            return
+
+        gx, gy = self._nav_original_goal
+
+        # ---- success branch ----
+        if succeeded:
+            if kind == "target":
+                # Done — we reached the real goal.
+                self._finalize_nav("succeeded")
+                return
+            # midpoint succeeded → retry the real target from new pose.
+            msg = (f"_on_nav_done: midpoint reached; retrying target=({gx:.2f},{gy:.2f}) "
+                   f"attempt={self._nav_attempt + 1}/{self._nav_max_attempts}")
+            self.get_logger().info(msg); _air_log.info(msg)
+            self._nav_attempt_kind = "target"
+            self._send_nav_goal(gx, gy)
+            return
+
+        # ---- failure branch ----
+        if kind == "midpoint":
+            # Even the midpoint failed — bot is genuinely stuck.
+            msg = f"_on_nav_done: midpoint also failed; giving up"
+            self.get_logger().info(msg); _air_log.info(msg)
+            self._finalize_nav("failed")
+            return
+
+        # kind == "target" failed → compute midpoint from CURRENT pose so each
+        # cycle starts from where the bot actually is, not a stale snapshot.
+        try:
+            t = self._tf_buffer.lookup_transform(
+                "map", "base_footprint", rclpy.time.Time(),
+                timeout=Duration(seconds=0.5),
+            )
+            rx, ry = t.transform.translation.x, t.transform.translation.y
+        except Exception as e:
+            msg = f"_on_nav_done: tf lookup failed ({e}); giving up"
+            self.get_logger().info(msg); _air_log.info(msg)
+            self._finalize_nav("failed")
+            return
+
+        mx = rx + (gx - rx) * 0.5
+        my = ry + (gy - ry) * 0.5
+        msg = (f"_on_nav_done: target failed at ({gx:.2f},{gy:.2f}); "
+               f"bot=({rx:.2f},{ry:.2f}) → midpoint=({mx:.2f},{my:.2f})")
+        self.get_logger().info(msg); _air_log.info(msg)
+        self._nav_attempt_kind = "midpoint"
+        self._send_nav_goal(mx, my)
 
     def _finalize_nav(self, status_str: str) -> None:
         """Terminal cleanup shared by success / cancel / exhausted-retries paths.
