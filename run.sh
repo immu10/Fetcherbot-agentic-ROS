@@ -15,6 +15,16 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 WS_ROOT="$REPO_ROOT/ros"
 
+# Load .env so launch-time env vars (AIR_RVIZ, AIR_SAVE_SCANS, ...) reach the
+# launch script. agent_node reads .env on its own via python-dotenv, but the
+# launch file's os.environ.get only sees real shell env, so we have to export.
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$REPO_ROOT/.env"
+    set +a
+fi
+
 # Always source ROS itself.
 source /opt/ros/humble/setup.bash
 
