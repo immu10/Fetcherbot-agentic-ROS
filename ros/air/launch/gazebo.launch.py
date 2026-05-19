@@ -167,6 +167,9 @@ def _spawn_checkpoint_marker(name: str, x: float, y: float):
 TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
 TB3_SIM_LAUNCH  = "gazebo.launch.py"
 
+# Flip to False to skip RViz on launch (e.g. WSL without X server).
+RVIZ_ENABLED = True
+
 
 # ---------- spawning real Gazebo models ----------
 # Switched away from inline-SDF primitive shapes to Gazebo's bundled model
@@ -290,14 +293,10 @@ def generate_launch_description():
     delayed_nav2 = TimerAction(period=8.0, actions=[nav2_launch])
 
     # 4b) RViz — Nav2's default view shows /map, both costmaps, the planned
-    #     path, the local plan, and the bot's footprint. Lets you see exactly
-    #     where the planner is trying to route and where the controller bails
-    #     out. Comes free with nav2_bringup; no need to vendor a config.
-    #
-    #     Opt-in via AIR_RVIZ=1 in your .env / shell. Default off because
-    #     WSL needs WSLg or an X server set up — silent failure otherwise.
-    rviz_enabled = os.environ.get("AIR_RVIZ", "0") == "1"
-    if rviz_enabled:
+    #     path, the local plan, and the bot's footprint. Gated by the
+    #     RVIZ_ENABLED constant at the top of this file — flip it to False
+    #     if WSL X server is missing or RViz crashes on your machine.
+    if RVIZ_ENABLED:
         rviz_config = PathJoinSubstitution([
             FindPackageShare("nav2_bringup"), "rviz", "nav2_default_view.rviz",
         ])
@@ -341,5 +340,5 @@ def generate_launch_description():
         delayed_slam,
         delayed_nav2,
         delayed_agent,
-        *([delayed_rviz] if rviz_enabled else []),
+        *([delayed_rviz] if RVIZ_ENABLED else []),
     ])

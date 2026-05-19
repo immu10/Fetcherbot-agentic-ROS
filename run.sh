@@ -15,32 +15,6 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 WS_ROOT="$REPO_ROOT/ros"
 
-# Load .env so launch-time env vars (AIR_RVIZ, AIR_SAVE_SCANS, ...) reach the
-# launch script. agent_node reads .env on its own via python-dotenv, but the
-# launch file's os.environ.get only sees real shell env, so we have to export.
-#
-# Note: we can't `source .env` directly — python-dotenv is more lenient about
-# syntax (spaces around =, unquoted values with special chars) and bash chokes.
-# Instead, parse only well-formed KEY=VALUE lines, strip surrounding quotes,
-# and export each one explicitly. Skip comments and blank lines.
-if [ -f "$REPO_ROOT/.env" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Skip comments and blanks.
-        case "$line" in
-            ''|\#*) continue ;;
-        esac
-        # Only accept KEY=VALUE form (KEY is alphanumeric + underscore).
-        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-            # Strip optional surrounding double or single quotes.
-            val="${val%\"}"; val="${val#\"}"
-            val="${val%\'}"; val="${val#\'}"
-            export "$key=$val"
-        fi
-    done < "$REPO_ROOT/.env"
-fi
-
 # Always source ROS itself.
 source /opt/ros/humble/setup.bash
 
