@@ -18,10 +18,15 @@ Launch arguments:
   spawn_objects : 'false' to skip the test-object spawns (default: true).
 """
 
+import json
+import os
+import tempfile
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    SetEnvironmentVariable,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -29,6 +34,84 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+# ---------- named checkpoints ----------
+# Single source of truth for "places the bot knows by name". Drives BOTH:
+#   1. Visual markers spawned in Gazebo (so you can see where each name is).
+#   2. The AIR_CHECKPOINTS env var that agent_node parses at startup, exposing
+#      list_checkpoints() and go_to_checkpoint(name) tools to the LLM.
+#
+# Real-world analog: a marker would be a sign / doorway / decal NEXT TO the
+# actual destination, not blocking it. We use a no-collision SDF below so Nav2's
+# costmap doesn't inflate around the marker and the bot can drive right up to
+# the named coordinate.
+#
+# FUTURE:
+#   - A `save_checkpoint(name)` tool could let the user teach new spots at
+#     runtime (capture current bot pose via tf, append here / persist to YAML).
+#   - "Fetch to me" — instead of a fixed checkpoint, run YOLO for the 'person'
+#     class, project to map frame, navigate to that point. Falls back to
+#     ask_user if no person is detected. Keeps the checkpoint dict relevant
+#     for non-person destinations ("put it on the desk").
+# Out of scope for now — edit this dict and re-launch to add places.
+CHECKPOINTS = {
+    # name:    (x,    y)   in map frame
+    "kitchen": (2.0,  1.0),
+    "desk":    (-1.5, 0.5),
+    "couch":   (1.0, -1.5),
+}
+
+
+# Purely visual marker — no <collision> tag means Nav2 ignores it entirely.
+# A blue post with an orange ball on top, ~0.7m tall (visible above clutter
+# but not in the way of the camera at table height).
+_MARKER_SDF = """<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="MODEL_NAME">
+    <static>true</static>
+    <link name="link">
+      <visual name="post">
+        <pose>0 0 0.30 0 0 0</pose>
+        <geometry><cylinder><radius>0.04</radius><length>0.60</length></cylinder></geometry>
+        <material>
+          <ambient>0.1 0.5 0.9 1</ambient>
+          <diffuse>0.1 0.5 0.9 1</diffuse>
+        </material>
+      </visual>
+      <visual name="cap">
+        <pose>0 0 0.65 0 0 0</pose>
+        <geometry><sphere><radius>0.08</radius></sphere></geometry>
+        <material>
+          <ambient>0.9 0.4 0.1 1</ambient>
+          <diffuse>0.9 0.4 0.1 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
+"""
+
+
+def _spawn_checkpoint_marker(name: str, x: float, y: float):
+    """Write the no-collision SDF to /tmp and spawn it via gazebo_ros.
+    Using -file (not -string) because the apt-installed spawn_entity.py on
+    Humble doesn't accept -string in all builds.
+    """
+    sdf_path = os.path.join(tempfile.gettempdir(), f"air_cp_{name}.sdf")
+    with open(sdf_path, "w") as f:
+        f.write(_MARKER_SDF.replace("MODEL_NAME", f"cp_{name}"))
+    return Node(
+        package="gazebo_ros",
+        executable="spawn_entity.py",
+        name=f"spawn_cp_{name}",
+        output="screen",
+        arguments=[
+            "-entity", f"cp_{name}",
+            "-file", sdf_path,
+            "-x", str(x), "-y", str(y), "-z", "0.0",
+        ],
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -104,6 +187,14 @@ def generate_launch_description():
         condition=IfCondition(do_spawn),
     )
 
+    # Checkpoint markers — same delay as object spawns. Always spawned (not
+    # gated by spawn_objects); they're cheap and the agent_node will only see
+    # them if AIR_CHECKPOINTS is set, which we do unconditionally below.
+    checkpoint_spawns = [
+        _spawn_checkpoint_marker(n, x, y) for n, (x, y) in CHECKPOINTS.items()
+    ]
+    delayed_checkpoints = TimerAction(period=8.0, actions=checkpoint_spawns)
+
     # 3) SLAM — slam_toolbox in mapping mode (online async). Publishes /map and
     #    the map→odom→base_footprint tf chain that Nav2 + ground-plane
     #    projection both consume. To switch to a saved-map workflow later,
@@ -170,8 +261,15 @@ def generate_launch_description():
         DeclareLaunchArgument("spawn_objects", default_value="true",
                               description="Set 'false' to skip the test-object spawns."),
 
+        # Export checkpoints to env so agent_node (started further down inside
+        # agent.launch.py) reads the same dict that drives the markers above.
+        # Must precede the agent include — env vars are inherited by child
+        # processes only if set before they're spawned.
+        SetEnvironmentVariable("AIR_CHECKPOINTS", json.dumps(CHECKPOINTS)),
+
         sim_launch,
         delayed_spawns,
+        delayed_checkpoints,
         delayed_slam,
         delayed_nav2,
         delayed_agent,

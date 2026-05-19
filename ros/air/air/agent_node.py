@@ -21,9 +21,11 @@ Stubs (raise NotImplementedError until wired to Nav2 / MoveIt2):
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -156,6 +158,29 @@ class AgentNode(Node):
         self.declare_parameter("yolo_model_path",   "yolo11s.pt")
         self.declare_parameter("yolo_conf",          0.35)
 
+        # Named checkpoints from gazebo.launch.py via the AIR_CHECKPOINTS env
+        # var (JSON: {"name": [x, y], ...}). Single source of truth — that
+        # launch file also spawns the visible markers. Empty if unset, in which
+        # case go_to_checkpoint() returns a clean error and list_checkpoints()
+        # returns an empty list. FUTURE: a save_checkpoint() tool could append
+        # at runtime; for now this is launch-time only.
+        self._checkpoints: dict[str, tuple[float, float]] = {}
+        raw_cp = os.environ.get("AIR_CHECKPOINTS", "").strip()
+        if raw_cp:
+            try:
+                parsed = json.loads(raw_cp)
+                self._checkpoints = {
+                    str(k): (float(v[0]), float(v[1])) for k, v in parsed.items()
+                }
+                self.get_logger().info(
+                    f"loaded {len(self._checkpoints)} checkpoint(s): "
+                    f"{list(self._checkpoints)}"
+                )
+            except Exception as e:
+                self.get_logger().warn(
+                    f"AIR_CHECKPOINTS parse failed: {e} (raw={raw_cp!r})"
+                )
+
         # Sensor data + cv_bridge live behind a lock so scan_scene() (called
         # from the agent thread) and the subscription callbacks (executor
         # thread) don't race.
@@ -206,17 +231,36 @@ class AgentNode(Node):
             f"subscribed: rgb={RGB_TOPIC}  depth={DEPTH_TOPIC}  info={CAMERA_INFO_TOPIC}"
         )
 
-        # ---- ask_user: question/answer over std_msgs/String ----
-        # Publisher fires the question, the UI (or another node, or a
-        # `ros2 topic pub` from a human) replies on /agent/answer. We block
-        # the calling tool thread on _answer_event until the answer arrives
-        # or ask_timeout_s elapses.
+        # ---- unified user channel + outer-ring event queue ----
+        # ONE input topic for everything the user says — replies to ask_user,
+        # unprompted commands, mid-drive chatter. The subscriber decides which
+        # bucket each message lands in:
+        #   - if ask_user is currently blocked (_expecting_answer=True) → fulfill
+        #     it by waking _answer_event (existing tool semantics, unchanged).
+        #   - else → push onto _event_queue as a "user" event. run_interactive_loop
+        #     drains the queue and invokes the LLM with that text.
+        #
+        # The queue also carries non-user events (nav_done, future pick_done,
+        # interrupt, ...) so the outer ring has ONE place to wait on anything
+        # that might wake the LLM. Cheap, zero polling.
         self._question_pub = self.create_publisher(String, "/agent/question", 10)
         self._response_pub = self.create_publisher(String, "/agent/response", 10)
-        self.create_subscription(String, "/agent/answer", self._on_answer, 10)
+        self.create_subscription(String, "/agent/user", self._on_user, 10)
+        self._event_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._expecting_answer = False
         self._answer_event = threading.Event()
         self._answer_lock  = threading.Lock()
         self._latest_answer: Optional[str] = None
+
+        # ---- coarse task phase ----
+        # IDLE / NAVIGATING / HOLDING. Used by the graph (via tools.get_phase)
+        # to restrict the LLM's tool palette per phase — kills whole classes of
+        # invalid actions ("pick_up while driving", "release empty-handed").
+        # Mutated by navigate_to (→navigating), _on_nav_done (→idle), pick_up
+        # (→holding, Stage 3), release (→idle, Stage 3). Lock so the LLM thread
+        # and executor thread can't observe a torn read.
+        self._phase: str = "idle"
+        self._phase_lock = threading.Lock()
 
         # ---- tf2 buffer (used by ground-plane projection in scan_scene) ----
         # The TransformListener subscribes to /tf and /tf_static via this node's
@@ -232,6 +276,13 @@ class AgentNode(Node):
         self._nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self._nav_goal_handle = None
         self._nav_last_status: Optional[int] = None  # last terminal GoalStatus.
+
+        # Event-driven nav: navigate_to() attaches a done-callback to Nav2's
+        # result future; that callback fires on the executor thread the instant
+        # Nav2 reports terminal, sets _nav_last_status + clears the handle, and
+        # sets this event. check_nav_status(wait_seconds=N) blocks on it instead
+        # of polling — one Groq call per drive instead of ~20.
+        self._nav_done_event = threading.Event()
 
         # ---- direct base velocity publisher ----
         # Used by look_around() to spin the bot in place. Bypasses Nav2 — fine
@@ -271,11 +322,23 @@ class AgentNode(Node):
         with self._frame_lock:
             self._latest_depth = depth
 
-    def _on_answer(self, msg: String):
-        """User reply on /agent/answer. Stash it and wake whoever's waiting."""
-        with self._answer_lock:
-            self._latest_answer = msg.data
-        self._answer_event.set()
+    def _on_user(self, msg: String):
+        """Unified user-input handler — routes one /agent/user message to the
+        right bucket based on whether ask_user is currently blocked.
+
+        - ask_user pending → wake it; the LLM gets the text as the tool result.
+        - otherwise → push onto the outer-ring event queue. run_interactive_loop
+          picks it up and runs the LLM with the text as the next turn.
+
+        Both buckets are non-blocking from the executor thread's POV.
+        """
+        text = msg.data
+        if self._expecting_answer:
+            with self._answer_lock:
+                self._latest_answer = text
+            self._answer_event.set()
+        else:
+            self._event_queue.put(("user", text))
 
     def _on_camera_info(self, msg: CameraInfo):
         # Build the pinhole model once; intrinsics rarely change at runtime.
@@ -506,9 +569,11 @@ class AgentNode(Node):
     def navigate_to(self, x: float, y: float) -> dict:
         """Send a NavigateToPose goal in `map` frame; return immediately.
 
-        The LLM polls completion via check_nav_status() — this method only
-        confirms the goal was accepted (status='active'), or returns a
-        descriptive failure if Nav2 isn't up / rejected the goal.
+        The LLM observes completion via check_nav_status(wait_seconds=N) which
+        blocks on _nav_done_event — set by _on_nav_done when Nav2 reports
+        terminal. No polling. This method just confirms the goal was accepted
+        (status='active'), or returns a descriptive failure if Nav2 isn't up /
+        rejected the goal.
 
         Orientation is identity (face +X). Future enhancement: face the goal
         by reading current robot pose from tf and computing yaw.
@@ -537,11 +602,64 @@ class AgentNode(Node):
         if goal_handle is None or not goal_handle.accepted:
             return {"status": "failed", "reason": "Nav2 rejected goal"}
 
-        # Stash for check_nav_status() to read.
+        # Stash for check_nav_status() to read, reset the done-event, and wire
+        # the result future's done callback. The callback fires on the executor
+        # thread the moment Nav2 sends the terminal result — sets the event so
+        # any blocked check_nav_status wakes immediately, AND pushes a nav_done
+        # event onto the outer-ring queue so the LLM gets re-invoked even if
+        # nobody was blocked on check_nav_status.
         self._nav_goal_handle = goal_handle
         self._nav_last_status = None
+        self._nav_done_event.clear()
+        goal_handle.get_result_async().add_done_callback(self._on_nav_done)
+
+        # Phase transition: anything that fires Nav2 sends us into NAVIGATING.
+        # _on_nav_done flips back to IDLE.
+        self.set_phase("navigating")
+
         self.get_logger().info(f"navigate_to: goal accepted target=({x:.2f}, {y:.2f})")
         return {"status": "active", "target": {"x": float(x), "y": float(y)}}
+
+    def _on_nav_done(self, future):
+        """Result-future callback: cache terminal status, wake any waiter,
+        notify the outer ring.
+
+        Runs on the rclpy executor thread. Keep it cheap — no LLM, no I/O —
+        just stash status, flip phase, set the event, push to the event queue.
+        """
+        try:
+            result = future.result()
+            status = result.status if result is not None else GoalStatus.STATUS_UNKNOWN
+        except Exception as e:
+            self.get_logger().warn(f"_on_nav_done: result future raised: {e}")
+            status = GoalStatus.STATUS_UNKNOWN
+
+        self._nav_last_status = status
+        self._nav_goal_handle = None
+        self._nav_done_event.set()
+        # Phase back to IDLE (the LLM may immediately enter HOLDING via pick_up
+        # in its next turn — that's set in pick_up itself, not here).
+        self.set_phase("idle")
+        # Wake the outer ring so the LLM is re-invoked with the result, even
+        # if it wasn't blocked on check_nav_status. Pre-empts any pending user
+        # event behind it — fine, both will be drained in order.
+        status_str = self._format_nav_status(status).get("status", "unknown")
+        self._event_queue.put(("nav_done", status_str))
+        self.get_logger().info(f"_on_nav_done: terminal status={status} ({status_str})")
+
+    # ---- phase accessors ----
+
+    def get_phase(self) -> str:
+        with self._phase_lock:
+            return self._phase
+
+    def set_phase(self, phase: str) -> None:
+        """Mutate the coarse task phase. Logged so transitions are auditable."""
+        with self._phase_lock:
+            prev, self._phase = self._phase, phase
+        if prev != phase:
+            self.get_logger().info(f"phase: {prev} → {phase}")
+            _air_log.info(f"phase: {prev} → {phase}")
 
     def approach(self, x: float, y: float, stop_distance: float = 0.30) -> dict:
         """Drive toward (x, y) but stop `stop_distance` metres short.
@@ -587,39 +705,84 @@ class AgentNode(Node):
         )
         return self.navigate_to(tx, ty)
 
-    def check_nav_status(self) -> dict:
-        """Map the current Nav2 goal state to a coarse status string for the LLM.
+    def list_checkpoints(self) -> dict:
+        """Return all named checkpoints the bot knows about.
+
+        Source: AIR_CHECKPOINTS env var, populated by gazebo.launch.py.
+        """
+        return {
+            "checkpoints": [
+                {"name": n, "x": x, "y": y}
+                for n, (x, y) in self._checkpoints.items()
+            ]
+        }
+
+    def go_to_checkpoint(self, name: str) -> dict:
+        """Navigate to a named checkpoint. Thin wrapper over navigate_to().
+
+        Returns a 'failed' dict (without contacting Nav2) if the name is
+        unknown, so the LLM can recover by calling list_checkpoints() or
+        ask_user() instead of waiting on a timeout.
+        """
+        if name not in self._checkpoints:
+            return {
+                "status": "failed",
+                "reason": (
+                    f"unknown checkpoint {name!r}; "
+                    f"known: {list(self._checkpoints) or '(none)'}"
+                ),
+            }
+        x, y = self._checkpoints[name]
+        self.get_logger().info(f"go_to_checkpoint: {name} → ({x:.2f}, {y:.2f})")
+        return self.navigate_to(x, y)
+
+    def check_nav_status(self, wait_seconds: float = 60.0) -> dict:
+        """Block up to wait_seconds for the active nav goal to terminate, then
+        return its status. If no goal is active, returns immediately with the
+        last cached terminal status (or 'idle' if none).
 
         States returned: idle | active | succeeded | failed | canceled.
-        Until navigate_to is implemented, _nav_goal_handle stays None and we
-        report 'idle' (or the last terminal status if a goal already finished).
-        """
-        gh = self._nav_goal_handle
-        if gh is not None:
-            # Active goal: query its current status.
-            status = gh.status
-            if status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING):
-                return {"status": "active"}
-            # Goal finished — clear the handle so future calls report from the
-            # cached terminal status instead of re-reading a stale handle.
-            self._nav_last_status = status
-            self._nav_goal_handle = None
 
-        last = self._nav_last_status
-        if last is None:
+        wait_seconds:
+          - 60 (default) — happy case for a multi-metre drive. ~1 LLM call total.
+          - small (e.g. 2-3) — when the LLM wants to interleave actions or check
+            on the user; returns 'active' on timeout, LLM can re-call.
+          - 0 — pure poll, no wait (matches old behaviour).
+        """
+        # Already terminal (callback fired before we got here, or never started)
+        # → return cached status without waiting.
+        if self._nav_goal_handle is None:
+            return self._format_nav_status(self._nav_last_status)
+
+        # Block on the done-event. The result-future callback (_on_nav_done)
+        # sets it the instant Nav2 reports terminal — zero polling, wakes
+        # immediately. Returns False on timeout.
+        woke = self._nav_done_event.wait(wait_seconds)
+        if not woke:
+            return {"status": "active"}
+
+        return self._format_nav_status(self._nav_last_status)
+
+    def _format_nav_status(self, status: Optional[int]) -> dict:
+        """Map a cached GoalStatus int to the coarse string the LLM expects."""
+        if status is None:
             return {"status": "idle"}
-        if last == GoalStatus.STATUS_SUCCEEDED:
+        if status == GoalStatus.STATUS_SUCCEEDED:
             return {"status": "succeeded"}
-        if last == GoalStatus.STATUS_CANCELED:
+        if status == GoalStatus.STATUS_CANCELED:
             return {"status": "canceled"}
-        # Aborted, unknown, or anything else terminal → failed.
-        return {"status": "failed"}
+        return {"status": "failed"}  # aborted / unknown / anything else terminal
 
     def pick_up(self, object_label: str) -> dict:
         raise NotImplementedError("pick_up: wire to MoveIt2 MoveGroup + GripperCommand.")
 
     def ask_user(self, question: str) -> dict:
-        """Publish a question, block until /agent/answer comes back (or timeout).
+        """Publish a question, block until /agent/user comes back (or timeout).
+
+        While blocked, `_expecting_answer` is True — the /agent/user subscriber
+        routes the next message to this call instead of the outer-ring event
+        queue. Cleared on exit so subsequent unprompted messages go to the
+        queue normally.
 
         Returns:
             {"answer": "<user reply>"}  on success
@@ -633,17 +796,21 @@ class AgentNode(Node):
             self._latest_answer = None
             self._answer_event.clear()
 
-        msg = String()
-        msg.data = question
-        self._question_pub.publish(msg)
-        self.get_logger().info(f"asked user: {question!r}  (timeout {timeout}s)")
+        self._expecting_answer = True
+        try:
+            msg = String()
+            msg.data = question
+            self._question_pub.publish(msg)
+            self.get_logger().info(f"asked user: {question!r}  (timeout {timeout}s)")
 
-        if not self._answer_event.wait(timeout=timeout):
-            return {"error": f"timeout after {timeout}s waiting for /agent/answer"}
+            if not self._answer_event.wait(timeout=timeout):
+                return {"error": f"timeout after {timeout}s waiting for /agent/user"}
 
-        with self._answer_lock:
-            answer = self._latest_answer or ""
-        return {"answer": answer}
+            with self._answer_lock:
+                answer = self._latest_answer or ""
+            return {"answer": answer}
+        finally:
+            self._expecting_answer = False
 
     # ---- scan-only loop (LLM disabled) ----
 
@@ -680,60 +847,113 @@ class AgentNode(Node):
     # ---- top-level interactive loop ----
 
     def run_interactive_loop(self):
-        """Ask → run agent → publish reply → repeat. Blocks the calling thread.
+        """Event-driven outer ring. Blocks on the event queue; only invokes the
+        LLM when something happens (user message on /agent/user, or Nav2 done).
 
-        Triggered from main() once the node is up. The first prompt is broadcast
-        on /agent/question so a UI (or a `ros2 topic pub` from a human) can
-        reply on /agent/answer. Each completed run's text reply is published on
-        /agent/response. Type 'quit' / 'exit' / 'q' to exit cleanly.
+        Lifecycle:
+          1. Wait for first event. If it's a 'user' event, start a session
+             with [SystemMessage, HumanMessage(text)] as history. nav_done
+             events with no active session are dropped (nothing to react to).
+          2. Call agent.run_step(history). The graph runs think → tool → ...
+             until it either:
+               (a) FINISHES — a natural-language reply, no further tools. Publish
+                   it on /agent/response and reset the session.
+               (b) YIELDS — fired a nav-firing tool (navigate_to / approach /
+                   go_to_checkpoint). Keep history, go back to waiting on the
+                   event queue. Next nav_done or user message resumes.
+          3. Loop.
 
-        Every exception inside agent.run() is caught and reported as the reply
-        — a bad GROQ_API_KEY surfaces as a one-line error, not a node crash.
+        Type 'quit' / 'exit' / 'q' to exit cleanly. Exceptions inside the graph
+        surface as the reply, not a node crash.
         """
         try:
-            from agent.agent import run as run_agent
-            from agent.prompts import INTERACTIVE_PROMPT
+            from agent.agent import run_step as run_agent_step
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from agent.prompts import SYSTEM_PROMPT
         except Exception as e:
-            err = f"could not import agent.agent.run ({type(e).__name__}: {e}); the LLM loop is disabled. Node will idle."
+            err = (f"could not import agent.agent.run_step "
+                   f"({type(e).__name__}: {e}); the LLM loop is disabled. "
+                   "Node will idle.")
             self.get_logger().error(err)
             _air_log.error(err)
             threading.Event().wait()
             return
 
-        self.get_logger().info("interactive loop ready — awaiting first command.")
+        self.get_logger().info(
+            "interactive loop ready — listening on /agent/user."
+        )
         _air_log.info("interactive loop ready.")
+
+        history: list = []  # SystemMessage + running turns; reset between tasks
+
         while rclpy.ok():
-            ask = self.ask_user(INTERACTIVE_PROMPT)
-            if "error" in ask:
-                # Most likely an ask_timeout. Loop and re-prompt so the user
-                # has another chance instead of dying silently.
-                msg = f"ask_user: {ask['error']}; re-prompting."
-                self.get_logger().warn(msg)
-                _air_log.warning(msg)
-                continue
-
-            command = (ask.get("answer") or "").strip()
-            if not command:
-                continue
-            if command.lower() in ("quit", "exit", "q"):
-                self.get_logger().info("user exited interactive loop.")
-                _air_log.info("user exited interactive loop.")
-                return
-
-            self.get_logger().info(f"running agent on: {command!r}")
-            _air_log.info(f"command: {command!r}")
             try:
-                reply = run_agent(command)
-            except Exception as e:
-                reply = f"[error] {type(e).__name__}: {e}"
-                self.get_logger().error(reply)
-                _air_log.exception("agent.run failed")
+                ev_type, ev_payload = self._event_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue  # lets us notice rclpy shutdown promptly
 
-            self.get_logger().info(f"[agent reply] {reply}")
-            _air_log.info(f"reply: {reply}")
-            out = String()
-            out.data = reply
-            self._response_pub.publish(out)
+            # --- translate event → next message for the LLM ---
+            if ev_type == "user":
+                text = (ev_payload or "").strip()
+                if not text:
+                    continue
+                if text.lower() in ("quit", "exit", "q"):
+                    self.get_logger().info("user exited interactive loop.")
+                    _air_log.info("user exited interactive loop.")
+                    return
+                if not history:
+                    history = [SystemMessage(content=SYSTEM_PROMPT)]
+                    self.get_logger().info(f"new session: {text!r}")
+                    _air_log.info(f"new session: {text!r}")
+                else:
+                    self.get_logger().info(f"user (mid-session): {text!r}")
+                    _air_log.info(f"user (mid-session): {text!r}")
+                history.append(HumanMessage(content=text))
+
+            elif ev_type == "nav_done":
+                if not history:
+                    # Nav finished but no live session — likely the LLM had
+                    # already wrapped up (final_reply published) before the
+                    # callback fired. Nothing to react to.
+                    self.get_logger().info(
+                        f"nav_done={ev_payload} ignored (no active session)"
+                    )
+                    continue
+                # Inject as a HumanMessage tagged [system] so the LLM treats
+                # it as an observation rather than a user instruction. Using
+                # SystemMessage mid-conversation confuses some model APIs.
+                note = f"[system] navigation finished: {ev_payload}"
+                history.append(HumanMessage(content=note))
+                self.get_logger().info(f"nav_done injected: {ev_payload}")
+                _air_log.info(f"nav_done injected: {ev_payload}")
+
+            else:
+                self.get_logger().warn(f"unknown event type: {ev_type!r}")
+                continue
+
+            # --- run one graph step ---
+            try:
+                history, reply, yielded = run_agent_step(history)
+            except Exception as e:
+                err = f"[error] {type(e).__name__}: {e}"
+                self.get_logger().error(err)
+                _air_log.exception("agent.run_step failed")
+                out = String(); out.data = err
+                self._response_pub.publish(out)
+                history = []
+                continue
+
+            # --- publish + decide whether to reset session ---
+            if reply:
+                self.get_logger().info(f"[agent reply] {reply}")
+                _air_log.info(f"reply: {reply}")
+                out = String(); out.data = reply
+                self._response_pub.publish(out)
+
+            if not yielded:
+                # Task done (graph returned a final reply, no more tools queued).
+                # Drop history so the next user message starts fresh.
+                history = []
 
     def shutdown(self):
         try:

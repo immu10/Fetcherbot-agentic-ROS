@@ -130,9 +130,22 @@ def approach(x: float, y: float, stop_distance: float = 0.30) -> str:
 
 
 @tool
-def check_nav_status() -> str:
-    """Poll the navigation status: idle | active | succeeded | failed | canceled."""
-    return json.dumps(agent_tools.check_nav_status())
+def check_nav_status(wait_seconds: float = 60.0) -> str:
+    """Wait up to wait_seconds for the active navigation to finish, then return
+    its status: idle | active | succeeded | failed | canceled.
+
+    This BLOCKS server-side on a Nav2 result-callback event — it does NOT poll.
+    Call it once after navigate_to / approach / go_to_checkpoint and you'll
+    wake up the moment the drive ends. No need to call repeatedly.
+
+    wait_seconds:
+      - 60 (default) — fine for any normal drive in this room.
+      - small (2-5) — when you want to interleave (e.g. ask the user something
+        mid-drive). Returns 'active' on timeout; you can call again to resume
+        waiting.
+      - 0 — no wait, immediate snapshot.
+    """
+    return json.dumps(agent_tools.check_nav_status(wait_seconds=wait_seconds))
 
 
 @tool
@@ -142,49 +155,122 @@ def pick_up(object_label: str) -> str:
 
 
 @tool
+def list_checkpoints() -> str:
+    """List all named navigation checkpoints (e.g. 'kitchen', 'desk') the bot
+    knows about. Returns JSON: {"checkpoints": [{"name", "x", "y"}, ...]}.
+
+    Use this when the user mentions a place by name and you want to confirm
+    it exists before driving — or to discover what destinations are available
+    when answering a "where can you go?" question.
+    """
+    return json.dumps(agent_tools.list_checkpoints())
+
+
+@tool
+def go_to_checkpoint(name: str) -> str:
+    """Navigate to a named checkpoint (e.g. go_to_checkpoint('kitchen')).
+
+    Returns JSON status; status:'active' means accepted — poll check_nav_status
+    for completion. Returns status:'failed' immediately if the name is unknown
+    (no Nav2 round-trip wasted) — call list_checkpoints() first if unsure, or
+    ask_user() to clarify which place they meant.
+    """
+    return json.dumps(agent_tools.go_to_checkpoint(name=name))
+
+
+@tool
 def ask_user(question: str) -> str:
     """Ask the user a clarifying question. Blocks until the user replies on /agent/answer."""
     return json.dumps(agent_tools.ask_user(question=question))
 
 
-TOOLS = [scan_scene, navigate_to, approach, check_nav_status, pick_up, ask_user]
+ALL_TOOLS = [scan_scene, navigate_to, approach, check_nav_status, pick_up,
+             list_checkpoints, go_to_checkpoint, ask_user]
 # look_around removed — re-add to this list (and uncomment its @tool above) to enable.
+# release will join when Stage 3 wires it.
+
+# ---------- phase → allowed tools ----------
+# Restricting the LLM's tool palette per phase kills whole classes of invalid
+# action ("pick_up while driving", "release empty-handed") before the model
+# can even consider them. Also trims ~50-100 prompt tokens per turn.
+#
+# Permissive on read-only/safe tools (scan_scene, list_checkpoints, ask_user)
+# in every phase. Restrictive on stateful/destructive ones.
+TOOLS_BY_PHASE: dict[str, set[str]] = {
+    "idle": {
+        "scan_scene", "navigate_to", "approach", "go_to_checkpoint",
+        "list_checkpoints", "pick_up", "ask_user",
+    },
+    "navigating": {
+        # No new navs (already one in flight). check_nav_status lets the LLM
+        # answer "how much longer?" mid-drive without burning a real poll —
+        # it'll usually just return immediately with cached state.
+        "scan_scene", "list_checkpoints", "ask_user", "check_nav_status",
+    },
+    "holding": {
+        # Holding an object: can navigate to drop-off, can't pick up another
+        # thing. release (Stage 3) will land here once wired.
+        "scan_scene", "navigate_to", "approach", "go_to_checkpoint",
+        "list_checkpoints", "ask_user",
+    },
+}
+
+# Tools that fire Nav2 — exec_tool flags the turn as "yielded" after running
+# any of these so the graph ends without another think round. The outer ring
+# then waits on the event queue for nav_done before re-invoking.
+NAV_FIRING_TOOLS = {"navigate_to", "approach", "go_to_checkpoint"}
 
 
 # ---------- LLM ----------
 # Lazy: don't construct on import so AIR_LLM_ENABLED=0 (which avoids importing
 # this module entirely) doesn't pay the price, and a missing GROQ_API_KEY
-# error surfaces at run time, not import time.
-_llm = None
+# error surfaces at run time, not import time. We bind tools per think-call
+# (cheap) so the toolset can vary by phase.
+_base_llm = None
 
-def _get_llm():
-    global _llm
-    if _llm is None:
-        _llm = ChatGroq(model=MODEL, max_tokens=MAX_TOKENS).bind_tools(TOOLS)
-    return _llm
+def _get_base_llm():
+    global _base_llm
+    if _base_llm is None:
+        _base_llm = ChatGroq(model=MODEL, max_tokens=MAX_TOKENS)
+    return _base_llm
+
+
+def _llm_for_phase(phase: str):
+    """Return an LLM bound to the tool subset allowed in `phase`."""
+    allowed_names = TOOLS_BY_PHASE.get(phase, TOOLS_BY_PHASE["idle"])
+    tools = [t for t in ALL_TOOLS if t.name in allowed_names]
+    return _get_base_llm().bind_tools(tools)
 
 
 # ---------- graph state ----------
 
 class AgentState(TypedDict):
-    """Threaded through every node. `operator.add` makes lists concatenate."""
+    """Threaded through every node. `operator.add` concatenates message lists;
+    other fields use the default replace semantics."""
     messages: Annotated[List[AnyMessage], operator.add]
     final_reply: str
+    yielded: bool  # set True after a nav-firing tool; routes graph to finish
 
 
 # ---------- nodes ----------
 
 def think_node(state: AgentState) -> dict:
-    """Send the running message history to Groq; append its reply."""
+    """Send the running message history to Groq; append its reply.
+
+    Tool palette is selected by the current phase (read via agent_tools.get_phase()
+    so the source of truth stays in agent_node). Fewer tools = fewer prompt
+    tokens + fewer ways for the LLM to do something the phase doesn't allow.
+    """
     msgs = state["messages"]
-    _log.info(f"[graph] think: messages={len(msgs)}")
+    phase = agent_tools.get_phase()
+    _log.info(f"[graph] think: messages={len(msgs)} phase={phase}")
     if _LLM_DEBUG:
         try:
             _log.info(f"[graph] req body: {[m.dict() for m in msgs]}")
         except Exception:
             pass
 
-    response: AIMessage = _get_llm().invoke(msgs)
+    response: AIMessage = _llm_for_phase(phase).invoke(msgs)
 
     # Token usage lives in response_metadata.token_usage on the langchain-groq
     # response shape; guard against schema drift across versions.
@@ -234,31 +320,46 @@ def _run_tool(tc: dict) -> ToolMessage:
 
 
 def exec_tool_node(state: AgentState) -> dict:
-    """Run *every* tool call from the latest assistant turn.
+    """Run every tool call from the latest assistant turn.
 
-    Reached when the LLM made any non-pure-ask_user batch. We run the whole
-    batch (including any ask_user mixed in) because OpenAI/Groq tool-calling
-    requires every assistant tool_call.id to be answered before the next
-    think iteration — splitting the batch across nodes would break that
-    invariant.
+    OpenAI/Groq tool-calling requires every assistant tool_call.id to be
+    answered before the next think iteration, so the whole batch runs here
+    (including any ask_user mixed in).
+
+    If any call was a nav-firing tool (navigate_to / approach / go_to_checkpoint),
+    flag the turn as yielded. The graph routes yielded turns directly to finish
+    so the outer ring can park on the event queue instead of polling.
     """
     last = state["messages"][-1]
-    return {"messages": [_run_tool(tc) for tc in (last.tool_calls or [])]}
+    tcs = last.tool_calls or []
+    tool_msgs = [_run_tool(tc) for tc in tcs]
+    update: dict = {"messages": tool_msgs}
+    if any(tc["name"] in NAV_FIRING_TOOLS for tc in tcs):
+        update["yielded"] = True
+        _log.info("[graph] exec_tool: yielded (nav fired)")
+    return update
 
 
 def ask_user_node(state: AgentState) -> dict:
     """Run tool calls when the assistant turn is *only* ask_user calls.
 
-    This node exists for graph clarity — it makes the user-question state a
-    first-class transition rather than a hidden side-effect inside a tool
-    dispatch. Behaviour is identical to exec_tool_node; the split is semantic.
+    Kept separate from exec_tool for graph clarity — makes the user-question
+    state a first-class transition. Behaviour identical to exec_tool_node;
+    ask_user is not nav-firing, so no yield handling needed here.
     """
     last = state["messages"][-1]
     return {"messages": [_run_tool(tc) for tc in (last.tool_calls or [])]}
 
 
 def finish_node(state: AgentState) -> dict:
-    """Capture the LLM's final natural-language reply into final_reply."""
+    """Capture the LLM's final natural-language reply into final_reply.
+
+    Yielded turns end on a ToolMessage (the nav-firing call's result) — there
+    is no LLM reply to capture, so final_reply stays empty.
+    """
+    if state.get("yielded"):
+        _log.info("[graph] finish: yielded (no reply)")
+        return {"final_reply": ""}
     last = state["messages"][-1]
     text = last.content if isinstance(last.content, str) else str(last.content)
     reply = (text or "").strip()
@@ -279,6 +380,16 @@ def route_after_think(state: AgentState) -> str:
     return "exec_tool"
 
 
+def route_after_exec(state: AgentState) -> str:
+    """After tools ran, either yield (graph ends) or back to think.
+
+    Yielded turns happen when the LLM just fired Nav2 — we want the graph to
+    end so the outer ring can wait for nav_done. Non-yielded turns continue
+    reasoning normally.
+    """
+    return "finish" if state.get("yielded") else "think"
+
+
 # ---------- compile ----------
 
 def _build_graph():
@@ -294,7 +405,12 @@ def _build_graph():
         "ask_user":  "ask_user",
         "finish":    "finish",
     })
-    g.add_edge("exec_tool", "think")
+    # exec_tool fans out — back to think for more reasoning, or straight to
+    # finish if a nav-firing tool yielded.
+    g.add_conditional_edges("exec_tool", route_after_exec, {
+        "think":  "think",
+        "finish": "finish",
+    })
     g.add_edge("ask_user",  "think")
     g.add_edge("finish",    END)
     return g.compile()
@@ -306,24 +422,64 @@ _graph = _build_graph()
 
 # ---------- public API ----------
 
-def run(command: str) -> str:
-    """Run the agent loop on a single user command. Returns the final reply.
+def run_step(history: List[AnyMessage]) -> tuple[List[AnyMessage], str, bool]:
+    """Run the graph once against an existing message history.
 
-    Drop-in replacement for the previous Groq-only run(); agent_node calls
-    this exactly as before.
+    Returns:
+        (updated_history, reply, yielded)
+        - updated_history: messages list with everything the graph appended
+          (LLM turns, tool results) — caller (agent_node) keeps this across
+          step calls within a session.
+        - reply: final natural-language reply, or '' if yielded.
+        - yielded: True when a nav-firing tool was the last action and the
+          graph chose to end early. Caller should keep history and wait for
+          the next event (nav_done / user message).
+
+    Invoked once per "wakeup event" from the outer ring's event queue.
     """
-    _log.info(f"[graph] === run start === model={MODEL} command={command!r}")
+    _log.info(f"[graph] === step start === model={MODEL} history_len={len(history)}")
     initial: AgentState = {
-        "messages": [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=command),
-        ],
+        "messages": history,
         "final_reply": "",
+        "yielded": False,
     }
     final = _graph.invoke(initial, config={"recursion_limit": RECURSION_LIMIT})
-    reply = final.get("final_reply") or "(no reply)"
+    new_history = final["messages"]
+    reply = final.get("final_reply", "") or ""
+    yielded = bool(final.get("yielded"))
+    _log.info(
+        f"[graph] === step end === yielded={yielded} reply={reply!r} "
+        f"history_len={len(new_history)}"
+    )
+    return new_history, reply, yielded
+
+
+def run(command: str) -> str:
+    """One-shot back-compat helper for the standalone CLI (`python -m agent.agent`).
+
+    Wraps run_step in a single session: build history, step until not yielded.
+    Not used by agent_node anymore (that goes straight to run_step).
+    """
+    _log.info(f"[graph] === run start === model={MODEL} command={command!r}")
+    history: List[AnyMessage] = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=command),
+    ]
+    reply = ""
+    # Loop in case of yield — the CLI doesn't have a Nav2 backend to wake us,
+    # so in practice yield only happens under IS_TEST_RUN where check_nav_status
+    # returns 'succeeded' synthetically. Inject a synthetic nav_done so the LLM
+    # can continue reasoning.
+    for _ in range(8):
+        history, reply, yielded = run_step(history)
+        if not yielded:
+            break
+        # Real mode flips this in agent_node._on_nav_done; CLI/test mode has
+        # no Nav2 callback, so simulate the transition here.
+        agent_tools.set_phase("idle")
+        history.append(HumanMessage(content="[system] navigation finished: succeeded"))
     _log.info(f"[graph] === run end === reply={reply!r}")
-    return reply
+    return reply or "(no reply)"
 
 
 def main():

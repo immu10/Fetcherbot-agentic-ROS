@@ -54,26 +54,55 @@ def navigate_to(x: float, y: float) -> dict:
         # Pretend (1.2, 0.4) is blocked so the agent has to replan.
         if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
             return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
-        return {"status": "success", "reason": f"arrived at ({x}, {y})"}
+        set_phase("navigating")  # mirror real-mode transition (agent_node does this)
+        return {"status": "active", "target": {"x": x, "y": y}}
     return _node().navigate_to(x, y)
 
 
 def approach(x: float, y: float, stop_distance: float = 0.30) -> dict:
     if IS_TEST_RUN:
-        return {"status": "succeeded", "reason": f"approached ({x}, {y}) within {stop_distance}m"}
+        set_phase("navigating")
+        return {"status": "active", "reason": f"approaching ({x}, {y}) within {stop_distance}m"}
     return _node().approach(x, y, stop_distance)
 
 
-def check_nav_status() -> dict:
+def check_nav_status(wait_seconds: float = 60.0) -> dict:
     if IS_TEST_RUN:
-        return {"status": "idle"}
-    return _node().check_nav_status()
+        # Pretend the drive finished while we "waited". Lets the agent loop
+        # be exercised end-to-end offline without hanging.
+        return {"status": "succeeded"}
+    return _node().check_nav_status(wait_seconds=wait_seconds)
 
 
 def pick_up(object_label: str) -> dict:
     if IS_TEST_RUN:
         return {"status": "success", "object": object_label}
     return _node().pick_up(object_label)
+
+
+_FAKE_CHECKPOINTS = {
+    "kitchen": (2.0, 1.0),
+    "desk":    (-1.5, 0.5),
+    "couch":   (1.0, -1.5),
+}
+
+
+def list_checkpoints() -> dict:
+    if IS_TEST_RUN:
+        return {"checkpoints": [{"name": n, "x": x, "y": y}
+                                for n, (x, y) in _FAKE_CHECKPOINTS.items()]}
+    return _node().list_checkpoints()
+
+
+def go_to_checkpoint(name: str) -> dict:
+    if IS_TEST_RUN:
+        if name not in _FAKE_CHECKPOINTS:
+            return {"status": "failed",
+                    "reason": f"unknown checkpoint {name!r}; known: {list(_FAKE_CHECKPOINTS)}"}
+        x, y = _FAKE_CHECKPOINTS[name]
+        set_phase("navigating")
+        return {"status": "active", "target": {"name": name, "x": x, "y": y}}
+    return _node().go_to_checkpoint(name)
 
 
 def ask_user(question: str) -> dict:
@@ -89,6 +118,28 @@ def release():
         return
     from air.agent_node import shutdown_node
     shutdown_node()
+
+
+# ---------- phase forwarder ----------
+# The graph (agent.py) reads phase to pick which tools to bind. Source of
+# truth lives in agent_node (mutated by navigate_to / _on_nav_done / etc).
+# In test mode we keep a module-level fake so offline runs don't need a node.
+_test_phase = "idle"
+
+
+def get_phase() -> str:
+    if IS_TEST_RUN:
+        return _test_phase
+    return _node().get_phase()
+
+
+def set_phase(phase: str) -> None:
+    """Test-mode helper for advancing the fake phase. No-op in real mode —
+    agent_node mutates its own phase directly from navigate_to / pick_up / etc.
+    """
+    global _test_phase
+    if IS_TEST_RUN:
+        _test_phase = phase
 
 
 # ---------- LLM tools schema ----------
@@ -152,7 +203,9 @@ DISPATCH = {
     # "look_around": lambda **_: look_around(),  # DISABLED
     "navigate_to": lambda **kw: navigate_to(**kw),
     "approach": lambda **kw: approach(**kw),
-    "check_nav_status": lambda **_: check_nav_status(),
+    "check_nav_status": lambda **kw: check_nav_status(**kw),
     "pick_up": lambda **kw: pick_up(**kw),
     "ask_user": lambda **kw: ask_user(**kw),
+    "list_checkpoints": lambda **_: list_checkpoints(),
+    "go_to_checkpoint": lambda **kw: go_to_checkpoint(**kw),
 }

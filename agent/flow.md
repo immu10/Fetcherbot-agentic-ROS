@@ -2,165 +2,160 @@
 
 The agent runs in two layers:
 
-- **Outer ring** lives in [ros/air/air/agent_node.py](../ros/air/air/agent_node.py) — owns the
-  ROS topics (`/agent/question`, `/agent/answer`, `/agent/response`) and the
-  read-command → run-agent → publish-reply loop.
-- **Inner ring** lives in [agent/agent.py](agent.py) — a LangGraph state machine that
-  takes one user command, calls Groq + tools until a final reply is produced,
-  returns the reply.
+- **Outer ring** lives in [ros/air/air/agent_node.py](../ros/air/air/agent_node.py)
+  — owns the ROS topics (`/agent/user`, `/agent/question`, `/agent/response`)
+  and the **event-driven** loop. Blocks on an internal event queue; only
+  invokes the LLM when something happens (user message, Nav2 done, etc.).
+- **Inner ring** lives in [agent/agent.py](agent.py) — a LangGraph state
+  machine that runs one "step" per outer-ring event, calling Groq + tools
+  until it either produces a final reply or yields (after firing nav).
 
 ---
 
 ## The whole picture
 
 ```
-                    ┌──────────────┐
-START ─────────────►│ wait_for_cmd │ ◄────────────────────────────┐
-                    │  (publish    │                               │
-                    │   prompt,    │                               │
-                    │   await ans  │                               │
-                    │   on /agent/ │                               │
-                    │   answer)    │                               │
-                    └──────┬───────┘                               │
-                           │ command                                │
-                           ▼                                        │
-                    ┌──────────────┐                                │
-                    │    think     │ ◄──────────────────┐           │
-                    │  (groq call  │                     │           │
-                    │   via LangGr │                     │           │
-                    │   aph node)  │                     │           │
-                    └──────┬───────┘                     │           │
-                           │                              │           │
-            ┌──────────────┼──────────────┐               │           │
-            │ tool_calls:  │ tool_calls:  │ no tool_calls│           │
-            │ any non-     │ only         │ (final text) │           │
-            │ ask_user     │ ask_user     │              │           │
-            ▼              ▼              ▼              │           │
-     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐    │           │
-     │  exec_tool  │ │  ask_user   │ │   finish    │    │           │
-     │ (scan_scene,│ │ (publish Q  │ │ (capture    │    │           │
-     │  navigate_  │ │  on /agent/ │ │  reply into │    │           │
-     │  to, check_ │ │  question,  │ │  state.     │    │           │
-     │  nav_status,│ │  await ans  │ │  final_     │    │           │
-     │  pick_up,   │ │  on /agent/ │ │  reply)     │    │           │
-     │  ask_user   │ │  answer)    │ └──────┬──────┘    │           │
-     │  if mixed)  │ │             │        │           │           │
-     └──────┬──────┘ └──────┬──────┘        │           │           │
-            │ ToolMessage   │ ToolMessage   │ END       │           │
-            │ appended      │ appended      │ of run    │           │
-            └───────┬───────┘               │           │           │
-                    │                        │           │           │
-                    └────────────────────────┼───────────┘           │
-                          (back to think)    │                       │
-                                              ▼                       │
-                                    ┌──────────────────┐              │
-                                    │  publish_reply   │              │
-                                    │ (push final text │              │
-                                    │  on /agent/      │              │
-                                    │  response)       │              │
-                                    └────────┬─────────┘              │
-                                             │                        │
-                                             └────────────────────────┘
-                                                  (loop forever
-                                                   until "quit"
-                                                   or Ctrl-C)
+                        ┌─────────────────────────┐
+                        │      OUTER RING         │
+                        │    (run_interactive     │
+                        │       _loop)            │
+                        │                         │
+                        │   blocks on event queue │
+                        │   ─ user msg            │
+                        │   ─ nav_done            │
+                        │   ─ (future) pick_done  │
+                        │   ─ (future) interrupt  │
+                        └────────────┬────────────┘
+                                     │ event → append to history
+                                     ▼
+                        ┌─────────────────────────┐
+                        │      run_step(history)  │
+                        └────────────┬────────────┘
+                                     │
+                        ┌────────────▼────────────┐
+                        │         think           │ ◄────────┐
+                        │   (bind tools by phase, │          │
+                        │    invoke Groq)         │          │
+                        └────────────┬────────────┘          │
+                                     │                       │
+              ┌──────────────────────┼──────────────────────┐│
+              │ tool_calls (any)     │ only ask_user        ││ no tool calls
+              ▼                      ▼                      ▼│
+       ┌─────────────┐        ┌─────────────┐       ┌─────────────┐
+       │  exec_tool  │        │  ask_user   │       │   finish    │
+       │ (dispatch   │        │ (publish Q, │       │ (capture    │
+       │  every call,│        │  block on   │       │  final reply│
+       │  flag yield │        │  /agent/    │       │  or empty   │
+       │  if nav was │        │  user)      │       │  if yielded)│
+       │  fired)     │        └──────┬──────┘       └──────┬──────┘
+       └──────┬──────┘               │                     │
+              │                      │                     │
+       ┌──────┴───────┐               │                     │
+       │ yielded?     │               │                     │
+       │   no  → think│ ──────────────┴─────────────────────┤
+       │   yes → fin. │ ────────────────────────────────────┤
+       └──────────────┘                                     │
+                                                            ▼
+                                              ┌─────────────────────────┐
+                                              │  back to outer ring     │
+                                              │  ─ reply → /agent/      │
+                                              │     response            │
+                                              │  ─ if yielded → keep    │
+                                              │     history, wait again │
+                                              │  ─ else → reset session │
+                                              └─────────────────────────┘
 ```
 
-The dotted region inside the second column (`think` / `exec_tool` / `ask_user` /
-`finish`) is the **LangGraph** in [agent/agent.py](agent.py).
-
-The outer ring (`wait_for_cmd` / `publish_reply`) lives in
+The boxed inner region (`think` / `exec_tool` / `ask_user` / `finish`) is the
+**LangGraph** in [agent/agent.py](agent.py). The outer ring is in
 [agent_node.run_interactive_loop](../ros/air/air/agent_node.py).
+
+---
+
+## Why event-driven
+
+Previously the LLM polled `check_nav_status` every 1–2 seconds during a drive
+— ~20 Groq calls per nav. Now Nav2's result callback wakes the outer ring,
+which re-invokes the LLM exactly once. ~85–90% token reduction per fetch task.
+
+A nav-firing tool (`navigate_to` / `approach` / `go_to_checkpoint`) is special:
+after `exec_tool` runs one of these, the graph **yields** — ends the step
+without another `think` round. The outer ring keeps the message history and
+waits on the event queue. When `nav_done` arrives, it appends
+`"[system] navigation finished: <status>"` to history and re-invokes — the
+LLM resumes reasoning with full context.
+
+---
+
+## Phases & tool restriction
+
+Coarse task phase lives in `agent_node` (read by `agent_tools.get_phase()`).
+The graph rebinds the LLM's tool palette each `think` based on phase — kills
+whole classes of invalid action before the model can consider them.
+
+| Phase        | Allowed tools                                                                  | Entered by                  | Exited by                   |
+|--------------|-------------------------------------------------------------------------------|-----------------------------|-----------------------------|
+| `idle`       | scan, navigate, approach, go_to_checkpoint, list_checkpoints, pick_up, ask    | startup, after release      | navigate fires / pick_up    |
+| `navigating` | scan, list_checkpoints, ask, check_nav_status                                 | navigate_to / approach / go_to_checkpoint accepted | `_on_nav_done`               |
+| `holding`    | scan, navigate, approach, go_to_checkpoint, list_checkpoints, ask  *(release: Stage 3)* | pick_up success (Stage 3)   | release success (Stage 3)   |
+
+Permissive on read-only tools (`scan_scene`, `list_checkpoints`, `ask_user`)
+in every phase. Restrictive on stateful/destructive ones.
 
 ---
 
 ## Nodes (inner graph)
 
-| Node | What it does | Implemented in |
-|---|---|---|
-| `think` | Send running message history to Groq, append the response (`AIMessage`). Logs token counts, finish reason, and tool-call names. | `think_node` |
-| `exec_tool` | Run every tool call from the latest assistant turn through `agent_tools.DISPATCH`. Used when the LLM mixed any non-`ask_user` calls (or only non-`ask_user`). | `exec_tool_node` |
-| `ask_user` | Run when the assistant turn is **only** `ask_user` calls. Same dispatch as `exec_tool`; the split exists to make user-question pauses a visible graph state. | `ask_user_node` |
-| `finish` | Capture the LLM's final natural-language reply into `state.final_reply`. | `finish_node` |
-
-All four log to `logs/agent_*.log` via the `air` logger.
+| Node       | What it does                                                                                                               | Implemented in   |
+|------------|---------------------------------------------------------------------------------------------------------------------------|------------------|
+| `think`    | Read current phase, bind tools allowed in that phase, send history to Groq, append response.                              | `think_node`     |
+| `exec_tool`| Run every tool call from the latest assistant turn. Flag `yielded=True` if any call was a nav-firing tool.                | `exec_tool_node` |
+| `ask_user` | Run when the turn is **only** `ask_user`. Same dispatch as `exec_tool`; split for graph clarity.                          | `ask_user_node`  |
+| `finish`   | Capture final reply (empty if yielded).                                                                                    | `finish_node`    |
 
 ---
 
-## Routing rule (`route_after_think`)
+## Routing
 
 ```python
-tcs = last.tool_calls or []
-if not tcs:                                          → "finish"
-elif all(tc["name"] == "ask_user" for tc in tcs):    → "ask_user"
-else:                                                → "exec_tool"
+# after think:
+if no tool_calls:                         → finish
+elif all calls are ask_user:              → ask_user
+else:                                     → exec_tool
+
+# after exec_tool:
+if state.yielded (nav-firing tool ran):   → finish
+else:                                     → think
 ```
 
-The mixed case (`ask_user` + other tools in the same turn) goes through
-`exec_tool` — that node runs **all** tool calls (including any `ask_user`
-mixed in), because Groq's tool-calling API requires every assistant
-`tool_call.id` to be answered before the next `think` iteration. Splitting the
-batch across nodes would break that invariant.
-
 ---
 
-## Tools available to the LLM
+## ROS topics
 
-Each tool is defined in [agent/agent.py](agent.py) as a `@tool`-decorated thin
-shim, forwarding to [agent/tools.py](tools.py)'s `DISPATCH` (which respects the
-`IS_TEST_RUN` gate and the ROS singleton).
+| Topic              | Dir  | Purpose                                                              |
+|--------------------|------|----------------------------------------------------------------------|
+| `/agent/user`      | sub  | All user input. Subscriber routes to ask_user wait or event queue.  |
+| `/agent/question`  | pub  | Questions from the LLM (via `ask_user`).                            |
+| `/agent/response`  | pub  | Final replies from the LLM at end of a task.                        |
 
-| Tool | What it does | Backed by |
-|---|---|---|
-| `scan_scene()` | YOLO on latest RGB frame; ground-plane projection to `map` xyz | real ROS via `agent_node.scan_scene` |
-| `navigate_to(x, y)` | Send a `NavigateToPose` goal to Nav2 in `map` frame | real ROS via Nav2 action client |
-| `check_nav_status()` | Poll the stored Nav2 goal handle | real ROS via Nav2 action client |
-| `pick_up(object_label)` | Plan + execute arm grasp | **stub — `NotImplementedError`** |
-| `ask_user(question)` | Publish on `/agent/question`, block until `/agent/answer` | real ROS via the outer ring's pub/sub |
+The graph itself is pure Python — every ROS interaction is hidden in the tool
+dispatch. So:
 
-`navigate_to` returns immediately with `status:"active"`; the LLM polls
-completion via `check_nav_status()`.
-
----
-
-## Where ROS shows up
-
-The graph itself is pure Python — every ROS interaction is hidden inside the
-tool dispatch. So:
-
-- The graph can run in `IS_TEST_RUN=1` (canned data, no ROS) for laptop dev.
-- The graph can run inside `agent_node` (full ROS via the singleton).
-- Switching simulators (Gazebo → Unity) only touches the agent_node side and
-  the launch files; `agent.py` is untouched.
+- `IS_TEST_RUN=1` runs the graph + fake-tool layer with no ROS (laptop dev).
+- Real mode runs inside `agent_node` (full ROS via the singleton).
+- Switching simulators only touches `agent_node` + launch files; `agent.py`
+  is untouched.
 
 ---
 
 ## Knobs
 
-| Env var | Effect | Default |
-|---|---|---|
-| `GROQ_API_KEY` | Groq auth | required |
-| `AIR_LLM_ENABLED` | Outer ring runs the graph (`1`) or the scan-only loop (`0`) | `1` |
-| `AIR_LLM_DEBUG` | Inside `think_node`, log full request + response bodies | `0` |
-| `IS_TEST_RUN` | `agent_tools.DISPATCH` returns canned data instead of hitting ROS | `0` |
+| Env var            | Effect                                                                | Default  |
+|--------------------|----------------------------------------------------------------------|----------|
+| `GROQ_API_KEY`     | Groq auth                                                            | required |
+| `AIR_LLM_ENABLED`  | Outer ring runs the graph (`1`) or the scan-only loop (`0`)          | `1`      |
+| `AIR_LLM_DEBUG`    | Log full request + response bodies inside `think_node`               | `0`      |
+| `IS_TEST_RUN`      | `agent_tools.DISPATCH` returns canned data instead of hitting ROS    | `0`      |
+| `AIR_CHECKPOINTS`  | JSON `{name: [x, y]}` of named places (set by `gazebo.launch.py`)   | unset    |
 
 See [../md/check.md](../md/check.md) for the full reference.
-
----
-
-## What changed from the previous design
-
-Earlier sketch (in this file's git history) had a *router* upfront that classified
-each user turn as `communication` vs `navigation` vs `manipulation` and
-dispatched to one of two loops. We collapsed that to a single LangGraph because:
-
-- Groq's tool-calling already handles the "should I call a tool?" decision
-  (it routes to `finish` when no tool call is needed — that *is* the
-  conversational case).
-- A separate router would be one extra LLM call per turn, no behavioural win.
-- The "communication ⇄ action" jump is now just an `ask_user` tool call — no
-  classifier, no two-loop bookkeeping.
-
-If we ever want a true planning/decomposition step (the *"plan → think →
-verify"* pattern), it'd slot in as a new node before `think` — easy add to the
-graph, no architectural surgery.
