@@ -945,8 +945,8 @@ class AgentNode(Node):
         # reaching forward to a floor-level object directly in front of the bot.
         # Adjust if the gripper isn't landing where you expect.
         POSE_HOME      = [0.0,  0.0,  0.0,  0.0]
-        POSE_PRE_GRASP = [0.0,  0.8, -0.4, -0.4]   # extended low forward
-        POSE_GRASP     = [0.0,  1.3, -0.8, -0.5]   # wrist near floor
+        POSE_PRE_GRASP = [0.0,  1.0, -0.6, -0.6]   # extended low forward
+        POSE_GRASP     = [0.0,  1.5, -1.1, -0.9]   # wrist at floor level
         POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
 
         if not self._arm_client.wait_for_server(timeout_sec=2.0):
