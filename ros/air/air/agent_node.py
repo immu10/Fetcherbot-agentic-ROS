@@ -566,17 +566,30 @@ class AgentNode(Node):
             return None  # ray points away from / above ground
         return {"x": float(ox + s * rx), "y": float(oy + s * ry), "z": 0.0}
 
-    def navigate_to(self, x: float, y: float) -> dict:
+    def navigate_to(self, points: list) -> dict:
         """Send a NavigateToPose goal in `map` frame; return immediately.
 
-        On failure, _on_nav_done auto-retries at points closer to the bot
-        (fractions 0.5, 0.25, 0.125 along bot→goal). Useful when the original
-        goal is outside the mapped costmap area — bisect lands somewhere
-        reachable instead of giving up. LLM only sees the final outcome.
+        `points` is a list of [x, y] pairs. For now we only use points[0]
+        (the primary target) — the bisect-retry logic below still handles
+        fallbacks at fractions 0.5, 0.25, 0.125 along bot→goal automatically.
+        Multi-waypoint chains can be wired up later by iterating `points`.
+
+        On failure, _on_nav_done auto-retries at points closer to the bot.
+        Useful when the original goal is outside the mapped costmap area —
+        bisect lands somewhere reachable instead of giving up. LLM only sees
+        the final outcome.
 
         The LLM observes completion via check_nav_status(wait_seconds=N) or
         a nav_done event on the outer-ring queue. No polling.
         """
+        if not points:
+            return {"status": "failed", "reason": "navigate_to: empty points list"}
+        x, y = float(points[0][0]), float(points[0][1])
+        if len(points) > 1:
+            self.get_logger().info(
+                f"navigate_to: {len(points)} points given, using points[0]=({x:.2f},{y:.2f}); "
+                "multi-waypoint not wired yet"
+            )
         # Snapshot bot pose so retries interpolate from a stable origin (not
         # from wherever the bot drifted to during recovery behaviors).
         try:
@@ -628,10 +641,10 @@ class AgentNode(Node):
         goal_handle.get_result_async().add_done_callback(self._on_nav_done)
 
         self.set_phase("navigating")
-        self.get_logger().info(
-            f"_send_nav_goal: goal accepted target=({x:.2f}, {y:.2f}) "
-            f"attempt={self._nav_attempt + 1}/{self._nav_max_attempts}"
-        )
+        msg = (f"_send_nav_goal: target=({x:.2f}, {y:.2f}) "
+               f"attempt={self._nav_attempt + 1}/{self._nav_max_attempts}")
+        self.get_logger().info(msg)
+        _air_log.info(msg)
         return {"status": "active", "target": {"x": float(x), "y": float(y)}}
 
     def _on_nav_done(self, future):
@@ -667,10 +680,10 @@ class AgentNode(Node):
             gx, gy = self._nav_original_goal
             new_x = sx + (gx - sx) * fraction
             new_y = sy + (gy - sy) * fraction
-            self.get_logger().info(
-                f"_on_nav_done: failed at ({gx:.2f},{gy:.2f}); "
-                f"retrying at fraction={fraction} → ({new_x:.2f},{new_y:.2f})"
-            )
+            msg = (f"_on_nav_done: failed at ({gx:.2f},{gy:.2f}); "
+                   f"retrying at fraction={fraction} → ({new_x:.2f},{new_y:.2f})")
+            self.get_logger().info(msg)
+            _air_log.info(msg)
             # Fire-and-forget — the new attempt's _on_nav_done will eventually
             # call _finalize_nav with whatever result it gets.
             self._send_nav_goal(new_x, new_y)
@@ -690,7 +703,11 @@ class AgentNode(Node):
         self.set_phase("idle")
         self._nav_done_event.set()
         self._event_queue.put(("nav_done", status_str))
-        self.get_logger().info(f"_finalize_nav: status={status_str}")
+        msg = (f"_finalize_nav: status={status_str} "
+               f"final_target={self._nav_original_goal} "
+               f"attempts_used={self._nav_attempt + 1}")
+        self.get_logger().info(msg)
+        _air_log.info(msg)
 
     # ---- phase accessors ----
 
@@ -748,7 +765,7 @@ class AgentNode(Node):
             f"approach: bot=({rx:.2f},{ry:.2f}) target=({x:.2f},{y:.2f}) "
             f"→ stop=({tx:.2f},{ty:.2f}) (was {dist:.2f}m, stop {stop_distance:.2f}m)"
         )
-        return self.navigate_to(tx, ty)
+        return self.navigate_to([[tx, ty]])
 
     def list_checkpoints(self) -> dict:
         """Return all named checkpoints the bot knows about.
@@ -779,7 +796,7 @@ class AgentNode(Node):
             }
         x, y = self._checkpoints[name]
         self.get_logger().info(f"go_to_checkpoint: {name} → ({x:.2f}, {y:.2f})")
-        return self.navigate_to(x, y)
+        return self.navigate_to([[x, y]])
 
     def check_nav_status(self, wait_seconds: float = 60.0) -> dict:
         """Block up to wait_seconds for the active nav goal to terminate, then

@@ -29,8 +29,18 @@ fi
 # 2) Source the workspace.
 source "$WS_ROOT/install/setup.bash"
 
-# 3) Launch with terminal-side noise filtered. Add patterns to the regex below
-#    when new spam appears. Logs on disk are unaffected.
-echo "[run.sh] launching air gazebo.launch.py (filtered terminal output)"
-ros2 launch air gazebo.launch.py 2>&1 | grep --line-buffered -Ev \
-  'worldToMap failed|out of map bounds|out of bounds of the costmap|controller_manager.*list_controllers|waiting for service /controller_manager'
+# 3) Launch. Two output sinks:
+#    a) Full unfiltered stream → logs/launch_<ts>.log (every ROS node, Nav2 BT,
+#       costmap warnings, the works). Greppable after the fact when you need to
+#       debug why a nav failed.
+#    b) Filtered live stream → your terminal (noise removed).
+#    Use `tee` to fork; `grep -v` only touches the terminal copy.
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+LAUNCH_LOG="$LOG_DIR/launch_$(date +%Y%m%d_%H%M%S).log"
+echo "[run.sh] launching air gazebo.launch.py"
+echo "[run.sh] full launch log → $LAUNCH_LOG"
+ros2 launch air gazebo.launch.py 2>&1 \
+  | tee "$LAUNCH_LOG" \
+  | grep --line-buffered -Ev \
+    'worldToMap failed|out of map bounds|out of bounds of the costmap|controller_manager.*list_controllers|waiting for service /controller_manager'

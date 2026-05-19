@@ -107,13 +107,17 @@ def scan_scene() -> str:
 
 
 @tool
-def navigate_to(x: float, y: float) -> str:
-    """Drive the robot base to the given (x, y) target position in map frame.
+def navigate_to(points: list) -> str:
+    """Drive the robot base in map frame. `points` is a list of [x, y] pairs.
 
-    Returns a JSON status; status:'active' means the goal was accepted —
-    poll check_nav_status for completion.
+    For a single destination, pass [[x, y]]. Currently only the primary target
+    (points[0]) is used; the rest are reserved for future multi-waypoint
+    routing — pass them anyway if you have a plan in mind.
+
+    Returns a JSON status; status:'active' means the goal was accepted — your
+    turn ends, you'll be re-invoked when nav completes (do NOT poll).
     """
-    return json.dumps(agent_tools.navigate_to(x=x, y=y))
+    return json.dumps(agent_tools.navigate_to(points=points))
 
 
 @tool
@@ -266,7 +270,8 @@ def think_node(state: AgentState) -> dict:
     _log.info(f"[graph] think: messages={len(msgs)} phase={phase}")
     if _LLM_DEBUG:
         try:
-            _log.info(f"[graph] req body: {[m.dict() for m in msgs]}")
+            body = json.dumps([m.model_dump() for m in msgs], indent=2, default=str)
+            _log.info(f"[graph] req body:\n{body}")
         except Exception:
             pass
 
@@ -288,7 +293,8 @@ def think_node(state: AgentState) -> dict:
         _log.info(f"[graph] tool_calls: {[tc['name'] for tc in response.tool_calls]}")
     if _LLM_DEBUG:
         try:
-            _log.info(f"[graph] resp body: {response.dict()}")
+            body = json.dumps(response.model_dump(), indent=2, default=str)
+            _log.info(f"[graph] resp body:\n{body}")
         except Exception:
             pass
 

@@ -49,14 +49,17 @@ def scan_scene() -> dict:
 #     return _node().look_around()
 
 
-def navigate_to(x: float, y: float) -> dict:
+def navigate_to(points: list) -> dict:
     if IS_TEST_RUN:
+        if not points:
+            return {"status": "failed", "reason": "navigate_to: empty points list"}
+        x, y = float(points[0][0]), float(points[0][1])
         # Pretend (1.2, 0.4) is blocked so the agent has to replan.
         if abs(x - 1.2) < 0.05 and abs(y - 0.4) < 0.05:
             return {"status": "failed", "reason": "path blocked at (1.1, 0.3)"}
         set_phase("navigating")  # mirror real-mode transition (agent_node does this)
         return {"status": "active", "target": {"x": x, "y": y}}
-    return _node().navigate_to(x, y)
+    return _node().navigate_to(points)
 
 
 def approach(x: float, y: float, stop_distance: float = 0.30) -> dict:
