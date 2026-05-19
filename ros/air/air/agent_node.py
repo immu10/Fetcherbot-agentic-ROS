@@ -426,7 +426,14 @@ class AgentNode(Node):
 
         detections = []
         for d in raw:
-            cx, cy = d["center"]
+            # Ground-plane projection assumes the projected pixel corresponds
+            # to a z=0 point. The bbox CENTER lies above the floor for any
+            # object with height, so projecting through it overshoots (ray
+            # continues past the object to the floor beyond).
+            # The bbox BOTTOM-center is approximately where the object touches
+            # the floor — that's the real z=0 contact point. Use it instead.
+            cx = d["center"][0]
+            cy = int(d["bbox"][3])  # y2 = bottom edge of bbox
             position = self._project_to_ground(cx, cy, cam_model, cam_frame, "map")
             detections.append({
                 "label":      d["label"],
