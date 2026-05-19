@@ -124,6 +124,13 @@ def _patched_nav2_params() -> str:
         # use the file as-is rather than silently doing nothing.
         return src
 
+    # Tighten the goal tolerance from upstream's 0.25 m → 0.10 m. Default is
+    # too loose for our use case — bot can stop 25 cm from a checkpoint marker
+    # and Nav2 still calls it "arrived", which looks visually short. 10 cm is
+    # close enough that the bot is visibly at the marker without being so
+    # tight that Nav2 spins forever trying to nudge into position.
+    patched = patched.replace("xy_goal_tolerance: 0.25", "xy_goal_tolerance: 0.10")
+
     out = os.path.join(tempfile.gettempdir(), "air_nav2_params.yaml")
     with open(out, "w") as f:
         f.write(patched)
