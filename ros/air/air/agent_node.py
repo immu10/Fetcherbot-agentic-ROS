@@ -360,9 +360,17 @@ class AgentNode(Node):
             model.fromCameraInfo(msg)
             with self._frame_lock:
                 self._cam_model = model
-                self._cam_frame_id = msg.header.frame_id or self._cam_frame_id
+                # Gazebo's camera plugin publishes frame_id="base_footprint"
+                # for this TB3 build, which is the bot's ground projection —
+                # NOT the camera. Casting a ray "from base_footprint" already
+                # sits on the floor, so every ground-plane projection collapses
+                # to the bot's own (x, y). Override to the URDF's actual
+                # optical frame so tf gives us the real camera pose.
+                claimed = msg.header.frame_id
+                self._cam_frame_id = "camera_rgb_optical_frame"
             self.get_logger().info(
-                f"camera intrinsics received (frame_id={self._cam_frame_id})."
+                f"camera intrinsics received (msg.frame_id={claimed!r}, "
+                f"using={self._cam_frame_id!r})."
             )
 
     # ---- tool methods (called from tools.py) ----
