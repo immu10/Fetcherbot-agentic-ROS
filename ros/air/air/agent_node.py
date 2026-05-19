@@ -400,10 +400,26 @@ class AgentNode(Node):
         # YOLO inference + per-detection extraction live in OD.py — agent_node
         # only adds the ROS-specific bit (project pixel → map frame via tf).
         try:
-            result, _ = OD.detect_frame(self._yolo, rgb)
+            result, annotated = OD.detect_frame(self._yolo, rgb)
             raw = OD.extract_detections(result)
         except Exception as e:
             return {"error": f"YOLO inference failed: {type(e).__name__}: {e}"}
+
+        # Dump the annotated frame to disk for visual debugging. Opt-in via
+        # AIR_SAVE_SCANS=1 so we don't pile up images on every run by default.
+        # Each scan gets a timestamped jpg under logs/scans/.
+        if os.environ.get("AIR_SAVE_SCANS") == "1" and _repo_root is not None:
+            try:
+                import cv2
+                scans_dir = os.path.join(_repo_root, "logs", "scans")
+                os.makedirs(scans_dir, exist_ok=True)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                path = os.path.join(scans_dir, f"scan_{ts}.jpg")
+                cv2.imwrite(path, annotated)
+                self.get_logger().info(f"scan saved → {path}")
+                _air_log.info(f"scan saved → {path}")
+            except Exception as e:
+                self.get_logger().warn(f"failed to save scan image: {e}")
 
         if not raw:
             return {"detections": []}
