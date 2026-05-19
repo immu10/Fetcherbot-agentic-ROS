@@ -284,6 +284,15 @@ class AgentNode(Node):
         # of polling — one Groq call per drive instead of ~20.
         self._nav_done_event = threading.Event()
 
+        # Bisect-retry state: if a goal fails because it's outside the mapped
+        # area / blocked, _on_nav_done re-fires at progressively closer points
+        # along the bot→goal line (0.5, 0.25, 0.125). LLM only sees the final
+        # result — no extra Groq calls. Reset on each user-initiated navigate_to.
+        self._nav_original_goal: Optional[tuple[float, float]] = None
+        self._nav_start_pose: Optional[tuple[float, float]] = None
+        self._nav_attempt: int = 0
+        self._nav_max_attempts: int = 4  # 1.0, 0.5, 0.25, 0.125
+
         # ---- direct base velocity publisher ----
         # Used by look_around() to spin the bot in place. Bypasses Nav2 — fine
         # for in-place rotation. Don't issue both this and navigate_to at the
@@ -560,14 +569,35 @@ class AgentNode(Node):
     def navigate_to(self, x: float, y: float) -> dict:
         """Send a NavigateToPose goal in `map` frame; return immediately.
 
-        The LLM observes completion via check_nav_status(wait_seconds=N) which
-        blocks on _nav_done_event — set by _on_nav_done when Nav2 reports
-        terminal. No polling. This method just confirms the goal was accepted
-        (status='active'), or returns a descriptive failure if Nav2 isn't up /
-        rejected the goal.
+        On failure, _on_nav_done auto-retries at points closer to the bot
+        (fractions 0.5, 0.25, 0.125 along bot→goal). Useful when the original
+        goal is outside the mapped costmap area — bisect lands somewhere
+        reachable instead of giving up. LLM only sees the final outcome.
 
-        Orientation is identity (face +X). Future enhancement: face the goal
-        by reading current robot pose from tf and computing yaw.
+        The LLM observes completion via check_nav_status(wait_seconds=N) or
+        a nav_done event on the outer-ring queue. No polling.
+        """
+        # Snapshot bot pose so retries interpolate from a stable origin (not
+        # from wherever the bot drifted to during recovery behaviors).
+        try:
+            t = self._tf_buffer.lookup_transform(
+                "map", "base_footprint", rclpy.time.Time(),
+                timeout=Duration(seconds=0.5),
+            )
+            self._nav_start_pose = (t.transform.translation.x, t.transform.translation.y)
+        except Exception:
+            # Fallback: use (0, 0) so bisect at least heads toward origin.
+            self._nav_start_pose = (0.0, 0.0)
+
+        self._nav_original_goal = (float(x), float(y))
+        self._nav_attempt = 0
+        return self._send_nav_goal(float(x), float(y))
+
+    def _send_nav_goal(self, x: float, y: float) -> dict:
+        """Lower-level: send one NavigateToPose goal and wire the callback.
+
+        Called by navigate_to (first attempt) AND by _on_nav_done (bisect
+        retries). Same Nav2 plumbing in both cases — only the (x, y) differs.
         """
         if not self._nav_client.wait_for_server(timeout_sec=2.0):
             return {"status": "failed", "reason": "Nav2 action server unavailable"}
@@ -582,7 +612,6 @@ class AgentNode(Node):
 
         send_future = self._nav_client.send_goal_async(goal)
 
-        # The executor thread is already spinning; just wait on the future.
         deadline = time.time() + 5.0
         while not send_future.done() and time.time() < deadline:
             time.sleep(0.05)
@@ -593,30 +622,23 @@ class AgentNode(Node):
         if goal_handle is None or not goal_handle.accepted:
             return {"status": "failed", "reason": "Nav2 rejected goal"}
 
-        # Stash for check_nav_status() to read, reset the done-event, and wire
-        # the result future's done callback. The callback fires on the executor
-        # thread the moment Nav2 sends the terminal result — sets the event so
-        # any blocked check_nav_status wakes immediately, AND pushes a nav_done
-        # event onto the outer-ring queue so the LLM gets re-invoked even if
-        # nobody was blocked on check_nav_status.
         self._nav_goal_handle = goal_handle
         self._nav_last_status = None
         self._nav_done_event.clear()
         goal_handle.get_result_async().add_done_callback(self._on_nav_done)
 
-        # Phase transition: anything that fires Nav2 sends us into NAVIGATING.
-        # _on_nav_done flips back to IDLE.
         self.set_phase("navigating")
-
-        self.get_logger().info(f"navigate_to: goal accepted target=({x:.2f}, {y:.2f})")
+        self.get_logger().info(
+            f"_send_nav_goal: goal accepted target=({x:.2f}, {y:.2f}) "
+            f"attempt={self._nav_attempt + 1}/{self._nav_max_attempts}"
+        )
         return {"status": "active", "target": {"x": float(x), "y": float(y)}}
 
     def _on_nav_done(self, future):
-        """Result-future callback: cache terminal status, wake any waiter,
-        notify the outer ring.
+        """Result-future callback: cache terminal status; either auto-retry
+        (bisect) or wake the outer ring with the final outcome.
 
-        Runs on the rclpy executor thread. Keep it cheap — no LLM, no I/O —
-        just stash status, flip phase, set the event, push to the event queue.
+        Runs on the rclpy executor thread. Keep it cheap — no LLM, no I/O.
         """
         try:
             result = future.result()
@@ -627,16 +649,48 @@ class AgentNode(Node):
 
         self._nav_last_status = status
         self._nav_goal_handle = None
-        self._nav_done_event.set()
-        # Phase back to IDLE (the LLM may immediately enter HOLDING via pick_up
-        # in its next turn — that's set in pick_up itself, not here).
-        self.set_phase("idle")
-        # Wake the outer ring so the LLM is re-invoked with the result, even
-        # if it wasn't blocked on check_nav_status. Pre-empts any pending user
-        # event behind it — fine, both will be drained in order.
+
+        # Succeeded / canceled → just report. Bisect only applies to failures
+        # (typical cause: goal off the global costmap, planner can't even start).
         status_str = self._format_nav_status(status).get("status", "unknown")
+        if status != GoalStatus.STATUS_ABORTED:
+            self._finalize_nav(status_str)
+            return
+
+        # Try the next bisect fraction if we have attempts left.
+        self._nav_attempt += 1
+        if (self._nav_attempt < self._nav_max_attempts
+                and self._nav_original_goal is not None
+                and self._nav_start_pose is not None):
+            fraction = 0.5 ** self._nav_attempt  # 0.5, 0.25, 0.125
+            sx, sy = self._nav_start_pose
+            gx, gy = self._nav_original_goal
+            new_x = sx + (gx - sx) * fraction
+            new_y = sy + (gy - sy) * fraction
+            self.get_logger().info(
+                f"_on_nav_done: failed at ({gx:.2f},{gy:.2f}); "
+                f"retrying at fraction={fraction} → ({new_x:.2f},{new_y:.2f})"
+            )
+            # Fire-and-forget — the new attempt's _on_nav_done will eventually
+            # call _finalize_nav with whatever result it gets.
+            self._send_nav_goal(new_x, new_y)
+            return
+
+        # All retries exhausted.
+        self.get_logger().info(
+            f"_on_nav_done: failed after {self._nav_attempt} attempts; giving up"
+        )
+        self._finalize_nav(status_str)
+
+    def _finalize_nav(self, status_str: str) -> None:
+        """Terminal cleanup shared by success / cancel / exhausted-retries paths.
+        Flips phase, sets the done event, pushes a nav_done event to the outer
+        ring.
+        """
+        self.set_phase("idle")
+        self._nav_done_event.set()
         self._event_queue.put(("nav_done", status_str))
-        self.get_logger().info(f"_on_nav_done: terminal status={status} ({status_str})")
+        self.get_logger().info(f"_finalize_nav: status={status_str}")
 
     # ---- phase accessors ----
 
