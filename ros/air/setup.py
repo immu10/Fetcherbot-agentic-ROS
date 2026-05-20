@@ -12,6 +12,7 @@ setup(
         (f"share/{package_name}/launch", [
             "launch/agent.launch.py",
             "launch/gazebo.launch.py",
+            "launch/arm_test.launch.py",
         ]),
     ],
     install_requires=["setuptools"],
