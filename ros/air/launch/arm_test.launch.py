@@ -74,6 +74,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         sim_launch,
-        delayed_ball,
+        delayed_obj,
         delayed_agent,
     ])
