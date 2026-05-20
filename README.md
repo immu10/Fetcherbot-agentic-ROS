@@ -1,5 +1,4 @@
-bleh
-
+needs to be updated with new flow
 
 # Robot Pipeline Flow
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
