@@ -959,12 +959,15 @@ class AgentNode(Node):
         if not self._gripper_client.wait_for_server(timeout_sec=2.0):
             return {"status": "failed", "reason": "gripper action server unavailable"}
 
+        # Long durations on purpose — the arm is heavy relative to the mobile
+        # base. Fast trajectories impart enough reaction force to lift the
+        # whole bot off the wheels. ~5 sec per motion stays smooth.
         try:
-            self._send_arm_pose(POSE_PRE_GRASP, duration_s=2.0)
+            self._send_arm_pose(POSE_PRE_GRASP, duration_s=5.0)
             self._send_gripper(0.019)                       # open (max ~0.019 rad)
-            self._send_arm_pose(POSE_GRASP, duration_s=1.5)
+            self._send_arm_pose(POSE_GRASP, duration_s=4.0)
             self._send_gripper(-0.01)                       # close on object
-            self._send_arm_pose(POSE_LIFT, duration_s=1.5)
+            self._send_arm_pose(POSE_LIFT, duration_s=4.0)
         except Exception as e:
             return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
 
