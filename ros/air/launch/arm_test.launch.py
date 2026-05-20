@@ -51,10 +51,15 @@ def generate_launch_description():
         ),
     )
 
-    # Ball ~30 cm in front of the bot. Bot spawns at (-2, -0.5) facing +X, so
-    # placing it at (-1.7, -0.5) puts it directly ahead at arm's reach.
-    ball = _spawn_db("ball", "cricket_ball", x=-1.7, y=-0.5, z=0.05)
-    delayed_ball = TimerAction(period=8.0, actions=[ball])
+    # Test object ~30 cm in front of the bot. Bot spawns at (-2, -0.5) facing
+    # +X, so (-1.7, -0.5) is directly ahead at arm's reach.
+    #
+    # Use a coke_can (cylinder) instead of a sphere — Gazebo's contact solver
+    # generates huge impulse forces against spheres because the contact patch
+    # is tiny, which sends the bot flying when the gripper touches it. Flat
+    # bases (cans, cubes) give stable contacts.
+    obj = _spawn_db("test_obj", "coke_can", x=-1.7, y=-0.5, z=0.05)
+    delayed_obj = TimerAction(period=8.0, actions=[obj])
 
     # agent_node — same one. With AIR_LLM_ENABLED=0 it fires pick_up() once
     # at startup, perfect for tuning arm poses without LLM round-trips.
