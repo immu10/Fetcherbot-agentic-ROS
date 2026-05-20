@@ -42,7 +42,7 @@ POSE_GRASP     = [0.0,  1.1, -0.7,  0.2]   # gripper at object height, parallel
 POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
 
 GRIPPER_OPEN   =  0.019    # max open
-GRIPPER_CLOSED = -0.01     # close on object
+GRIPPER_CLOSED =  0.0      # close on object (less aggressive than -0.01)
 
 # Durations (seconds). Long because the arm is heavy relative to the mobile
 # base; fast moves apply reaction forces that flip the bot.
@@ -75,6 +75,23 @@ def generate_launch_description():
             ])
         ),
     )
+
+    # MoveIt2 move_group — adds IK + motion planning on top of the controllers
+    # we already have running. Includes from the upstream config package. We
+    # rely on the sim already having published /robot_description and bringing
+    # up /joint_states via ros2_control, so we only need the brain, not the
+    # full Gazebo-tied launch.
+    move_group_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("turtlebot3_manipulation_moveit_config"),
+                "launch", "move_group.launch.py",
+            ])
+        ),
+        launch_arguments={"use_sim_time": "true"}.items(),
+    )
+    # Delay enough that sim + controllers are up first; MoveIt needs them.
+    delayed_move_group = TimerAction(period=9.0, actions=[move_group_launch])
 
     # Test object ~30 cm in front of the bot. coke_can (cylinder) instead of
     # cricket_ball (sphere) — Gazebo's contact solver doesn't blow up against
@@ -109,5 +126,6 @@ def generate_launch_description():
         SetEnvironmentVariable("AIR_LLM_ENABLED", "0"),
         sim_launch,
         delayed_obj,
+        delayed_move_group,
         delayed_agent,
     ])
