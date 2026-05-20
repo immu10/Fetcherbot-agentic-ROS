@@ -37,8 +37,8 @@ TB3_SIM_LAUNCH  = "gazebo.launch.py"
 # all of these as ROS params (see declare_parameter calls in its __init__).
 # Joint angles in radians for joint1..4 (OpenManipulator-X).
 # ============================================================================
-POSE_PRE_GRASP = [0.0,  0.5, -0.3,  0.0]   # extended forward, gripper level
-POSE_GRASP     = [0.0,  0.8, -0.5,  0.0]   # gripper at object height, parallel
+POSE_PRE_GRASP = [0.0,  0.7, -0.4,  0.1]   # extended forward, gripper level
+POSE_GRASP     = [0.0,  1.1, -0.7,  0.2]   # gripper at object height, parallel
 POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
 
 GRIPPER_OPEN   =  0.019    # max open
