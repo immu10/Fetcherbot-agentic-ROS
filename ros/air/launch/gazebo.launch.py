@@ -168,7 +168,7 @@ TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
 TB3_SIM_LAUNCH  = "gazebo.launch.py"
 
 # Flip to False to skip RViz on launch (e.g. WSL without X server).
-RVIZ_ENABLED = True
+RVIZ_ENABLED = False
 
 
 # ---------- spawning real Gazebo models ----------
