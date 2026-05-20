@@ -161,6 +161,21 @@ class AgentNode(Node):
         self.declare_parameter("yolo_model_path",   "yolo11s.pt")
         self.declare_parameter("yolo_conf",          0.35)
 
+        # Pick-up scripted poses (joint angles in radians, joint1..4 for the
+        # OpenManipulator-X arm). Overridable per-launch — see arm_test.launch.py
+        # which sets them to tuning values. Defaults are what worked last for
+        # the full fetch flow.
+        self.declare_parameter("pose_pre_grasp", [0.0,  0.5, -0.3,  0.0])
+        self.declare_parameter("pose_grasp",     [0.0,  0.8, -0.5,  0.0])
+        self.declare_parameter("pose_lift",      [0.0,  0.4,  0.0,  0.0])
+        self.declare_parameter("gripper_open",    0.019)
+        self.declare_parameter("gripper_closed", -0.01)
+        # Trajectory durations (seconds) — long because the arm is heavy
+        # relative to the mobile base; fast moves flip the bot.
+        self.declare_parameter("arm_dur_pre_grasp", 5.0)
+        self.declare_parameter("arm_dur_grasp",     4.0)
+        self.declare_parameter("arm_dur_lift",      6.0)
+
         # Named checkpoints from gazebo.launch.py via the AIR_CHECKPOINTS env
         # var (JSON: {"name": [x, y], ...}). Single source of truth — that
         # launch file also spawns the visible markers. Empty if unset, in which
@@ -941,36 +956,31 @@ class AgentNode(Node):
         """
         self.get_logger().info(f"pick_up: scripted routine for {object_label!r}")
 
-        # Joint poses (joint1..4) in radians. Tuned for OpenManipulator-X
-        # reaching forward to a floor-level object directly in front of the bot.
-        # Adjust if the gripper isn't landing where you expect.
-        POSE_HOME      = [0.0,  0.0,  0.0,  0.0]
-        # --- Grasp pose flavors. Uncomment the pair you want to test. ---
-        # PERPENDICULAR / top-down (gripper vertical, grabs like a claw from above):
-        #   POSE_PRE_GRASP = [0.0, 1.0, -0.6, 1.0]
-        #   POSE_GRASP     = [0.0, 1.5, -1.1, 1.4]
-        # PARALLEL / side-on (gripper horizontal, fingers approach from sides):
-        POSE_PRE_GRASP = [0.0,  1.0, -0.6,  0.3]   # gripper roughly horizontal
-        POSE_GRASP     = [0.0,  1.5, -1.1,  0.5]   # gripper parallel to floor
-        POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
+        # All pose / timing values come from ROS params. Defaults are declared
+        # in __init__; arm_test.launch.py overrides them while tuning so we
+        # don't dirty this file on every iteration.
+        pose_pre_grasp = list(self.get_parameter("pose_pre_grasp").value)
+        pose_grasp     = list(self.get_parameter("pose_grasp").value)
+        pose_lift      = list(self.get_parameter("pose_lift").value)
+        g_open         = float(self.get_parameter("gripper_open").value)
+        g_closed       = float(self.get_parameter("gripper_closed").value)
+        dur_pre_grasp  = float(self.get_parameter("arm_dur_pre_grasp").value)
+        dur_grasp      = float(self.get_parameter("arm_dur_grasp").value)
+        dur_lift       = float(self.get_parameter("arm_dur_lift").value)
 
         if not self._arm_client.wait_for_server(timeout_sec=2.0):
             return {"status": "failed", "reason": "arm action server unavailable"}
         if not self._gripper_client.wait_for_server(timeout_sec=2.0):
             return {"status": "failed", "reason": "gripper action server unavailable"}
 
-        # Long durations on purpose — the arm is heavy relative to the mobile
-        # base. Fast trajectories impart enough reaction force to lift the
-        # whole bot off the wheels. Lift especially needs to be slow because
-        # it carries the object mass + extends the moment arm.
         # Order: open gripper FIRST so fingers don't collide with the object
         # as the arm sweeps into pre_grasp / grasp.
         try:
-            self._send_gripper(0.019)                       # open (max ~0.019 rad)
-            self._send_arm_pose(POSE_PRE_GRASP, duration_s=5.0)
-            self._send_arm_pose(POSE_GRASP, duration_s=4.0)
-            self._send_gripper(-0.01)                       # close on object
-            self._send_arm_pose(POSE_LIFT, duration_s=6.0)
+            self._send_gripper(g_open)
+            self._send_arm_pose(pose_pre_grasp, duration_s=dur_pre_grasp)
+            self._send_arm_pose(pose_grasp,     duration_s=dur_grasp)
+            self._send_gripper(g_closed)
+            self._send_arm_pose(pose_lift,      duration_s=dur_lift)
         except Exception as e:
             return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
 

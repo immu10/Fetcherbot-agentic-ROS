@@ -1,22 +1,27 @@
-"""ros2 launch air arm_test.launch.py — Gazebo + bot + ball, NO Nav2/SLAM.
+"""ros2 launch air arm_test.launch.py — Gazebo + bot + test object, NO Nav2/SLAM.
 
 Stripped-down launch for tuning the scripted pick_up routine. Differences from
 gazebo.launch.py:
   - No Nav2, no SLAM, no RViz, no named checkpoints.
-  - Ball spawned ~30cm in front of the bot, on the floor — right at the
-    arm's reach so you don't need to drive anywhere.
-  - agent_node still comes up; run with AIR_LLM_ENABLED=0 so it fires
-    pick_up() once at startup automatically (see run_scan_only_loop).
+  - Test object spawned ~30 cm in front of the bot — right at arm's reach.
+  - agent_node still comes up, BUT with tuning overrides for pick_up poses
+    and durations declared right here in this file. Edit those values and
+    relaunch to iterate without touching agent_node.py.
+  - LLM is forced off here too (env var) so pick_up fires once at startup via
+    run_scan_only_loop.
 
-Iterate on POSE_PRE_GRASP / POSE_GRASP / POSE_LIFT in agent_node.py, then
-relaunch this. Faster turnaround than the full sim.
+Iterate flow:
+  1. Edit POSE_* / DUR_* below.
+  2. ./run_arm_test.sh --no-build  (launch files are installed, but Python
+     source for agent_node also is — re-build if you touched any *.py).
+  3. Watch the arm in Gazebo.
 """
 
 import os
 import tempfile
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -25,6 +30,26 @@ from launch_ros.substitutions import FindPackageShare
 
 TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
 TB3_SIM_LAUNCH  = "gazebo.launch.py"
+
+
+# ============================================================================
+# TUNING KNOBS — edit these to tune the scripted pick_up. agent_node reads
+# all of these as ROS params (see declare_parameter calls in its __init__).
+# Joint angles in radians for joint1..4 (OpenManipulator-X).
+# ============================================================================
+POSE_PRE_GRASP = [0.0,  0.5, -0.3,  0.0]   # extended forward, gripper level
+POSE_GRASP     = [0.0,  0.8, -0.5,  0.0]   # gripper at object height, parallel
+POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
+
+GRIPPER_OPEN   =  0.019    # max open
+GRIPPER_CLOSED = -0.01     # close on object
+
+# Durations (seconds). Long because the arm is heavy relative to the mobile
+# base; fast moves apply reaction forces that flip the bot.
+DUR_PRE_GRASP  = 5.0
+DUR_GRASP      = 4.0
+DUR_LIFT       = 6.0
+# ============================================================================
 
 
 def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
@@ -51,28 +76,37 @@ def generate_launch_description():
         ),
     )
 
-    # Test object ~30 cm in front of the bot. Bot spawns at (-2, -0.5) facing
-    # +X, so (-1.7, -0.5) is directly ahead at arm's reach.
-    #
-    # Use a coke_can (cylinder) instead of a sphere — Gazebo's contact solver
-    # generates huge impulse forces against spheres because the contact patch
-    # is tiny, which sends the bot flying when the gripper touches it. Flat
-    # bases (cans, cubes) give stable contacts.
+    # Test object ~30 cm in front of the bot. coke_can (cylinder) instead of
+    # cricket_ball (sphere) — Gazebo's contact solver doesn't blow up against
+    # flat-based objects.
     obj = _spawn_db("test_obj", "coke_can", x=-1.7, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
-    # agent_node — same one. With AIR_LLM_ENABLED=0 it fires pick_up() once
-    # at startup, perfect for tuning arm poses without LLM round-trips.
-    agent_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([
-                FindPackageShare("air"), "launch", "agent.launch.py",
-            ])
-        )
+    # agent_node — launched directly (not via agent.launch.py) so we can pass
+    # the tuning overrides as parameters. With AIR_LLM_ENABLED=0 (forced
+    # below) the scan-only loop fires pick_up() once at startup.
+    agent_node = Node(
+        package="air",
+        executable="agent_node",
+        name="agent_node",
+        output="screen",
+        parameters=[{
+            "pose_pre_grasp":     POSE_PRE_GRASP,
+            "pose_grasp":         POSE_GRASP,
+            "pose_lift":          POSE_LIFT,
+            "gripper_open":       GRIPPER_OPEN,
+            "gripper_closed":     GRIPPER_CLOSED,
+            "arm_dur_pre_grasp":  DUR_PRE_GRASP,
+            "arm_dur_grasp":      DUR_GRASP,
+            "arm_dur_lift":       DUR_LIFT,
+        }],
     )
-    delayed_agent = TimerAction(period=10.0, actions=[agent_launch])
+    delayed_agent = TimerAction(period=10.0, actions=[agent_node])
 
     return LaunchDescription([
+        # Force LLM off — pick_up runs automatically on startup via the
+        # scan-only loop. Matches what run_arm_test.sh exports.
+        SetEnvironmentVariable("AIR_LLM_ENABLED", "0"),
         sim_launch,
         delayed_obj,
         delayed_agent,
