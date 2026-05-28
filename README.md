@@ -1,6 +1,3 @@
-bleh
-
-
 # Robot Pipeline Flow
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
 
@@ -9,13 +6,14 @@ bleh
 ## Overview
 
 ```
-Voice Command → LLM Agent → [Tools] → Task Complete
+Voice / Text Command → LLM Agent → [Tools] → Task Complete
 ```
 
-The LLM agent is the brain of the system. It receives the voice command and
-dynamically decides which tools to call, in what order, and how to recover
-when something goes wrong. There is no hardcoded pipeline — the agent figures
-it out.
+The LLM agent is the brain. It receives a command and dynamically decides
+which tools to call, in what order, and how to recover when something goes
+wrong. There is no hardcoded pipeline — the agent figures it out, subject to
+a phase-based tool palette that prevents it from issuing conflicting commands
+mid-action (e.g. firing a new nav goal while the bot is already driving).
 
 ---
 
@@ -24,184 +22,223 @@ it out.
 ```
                         ┌─────────────────────────────┐
                         │         LLM Agent            │
-                        │                              │
-  Voice Command ──────► │  - Reasons about the task    │
-                        │  - Decides which tools to use │
-                        │  - Handles failures           │
-                        │  - Sequences waypoints        │
+                        │  (Groq Llama 3.3-70B,        │
+                        │   LangGraph state machine)   │
+  Voice / Text ───────► │                              │
+                        │  - Reasons about the task    │
+                        │  - Picks tools by phase      │
+                        │  - Handles failures          │
+                        │  - Sequences waypoints       │
                         └────────────┬─────────────────┘
                                      │
-                    ┌────────────────┼─────────────────┐
-                    │                │                  │
-             scan_scene()    navigate_to()         pick_up()
-                    │                │                  │
-                 YOLO            Nav2              MoveIt2
-                    │                │                  │
-                Gazebo           Gazebo             Gazebo
-                Camera            Base               Arm
+            ┌────────────┬───────────┼───────────┬──────────────┐
+            │            │           │           │              │
+       scan_scene  navigate_to  check_nav   pick_up      go_to_checkpoint
+            │            │           │           │              │
+          YOLO11       Nav2     (event-driven)  arm +          named
+       + ground-                              gripper          pose
+         plane                                actions          dict
+        projection                          (scripted)
+            │            │                      │
+         Gazebo       Gazebo                 Gazebo
+         Camera        Base                    Arm
 ```
+
+---
+
+## Event-Driven Outer Ring
+
+The agent loop is not a tight polling loop. It blocks on an event queue and
+wakes only on:
+
+- `user_msg` — new command from the user
+- `nav_done` — Nav2 reported success/failure
+- `pick_done` — arm/gripper sequence finished
+
+`check_nav_status` is therefore mostly a courtesy tool — Nav2 completion is
+already pushed into the queue automatically, so the LLM rarely needs to poll.
+
+### Phase-restricted tool palette
+
+| Phase        | Tools available                                                       |
+|--------------|-----------------------------------------------------------------------|
+| `idle`       | scan_scene, navigate_to, pick_up, list_checkpoints, go_to_checkpoint, ask_user |
+| `navigating` | check_nav_status, ask_user                                            |
+| `holding`    | navigate_to, go_to_checkpoint, ask_user                               |
+
+While navigating, the LLM cannot fire a new `navigate_to` — it can only ask
+questions or wait. This is what makes the loop sane during multi-step fetches.
 
 ---
 
 ## Agent Tools
 
-These are the tools the LLM agent can call. Each one maps to a ROS2 action
-or service under the hood.
-
 ### `scan_scene()`
-- Triggers the YOLO node to process the current camera frame
-- Returns a list of detected objects with labels, confidence scores, and 3D positions
-- Example output:
-```json
-{
-  "detections": [
-    { "label": "pen", "confidence": 0.91, "position": { "x": 1.2, "y": 0.4, "z": 0.01 } },
-    { "label": "eraser", "confidence": 0.87, "position": { "x": 0.8, "y": 0.6, "z": 0.01 } }
-  ]
-}
-```
+- Runs YOLO11 (`imgsz=1280` for small-object recall) on the current camera frame
+- For each detection, back-projects the bbox bottom edge onto the ground plane
+  via `image_geometry` + `tf2` to get a map-frame `(x, y)`
+- Optionally dumps annotated debug frames to `logs/scans/` when `AIR_SAVE_SCANS=1`
+- Returns label, confidence, bbox, and 3D position per detection
 
-### `navigate_to(position)`
-- Sends a navigation goal to Nav2
-- Robot base drives to the target position
-- Returns success or failure with reason
-- Example output:
-```json
-{ "status": "failed", "reason": "path blocked at (1.1, 0.3)" }
-```
+### `navigate_to(points: list, stop_distance: float = 0.0)`
+- Accepts a list of waypoints (currently uses `points[0]`)
+- `stop_distance` backs the goal off along the bot→target line — used to stop
+  ~40cm short of a pick target so the arm has room
+- Fires the goal, transitions phase to `navigating`, and returns immediately
+- Nav2 completion is pushed into the event queue, not polled
+
+#### Incremental midpoint retry
+If Nav2 fails (e.g. "off global costmap" because the target sits in unmapped
+space), the agent_node automatically:
+
+1. Picks the midpoint between the current pose and the original target
+2. Fires that as a fallback goal — succeeding here grows the costmap
+3. On midpoint success, retries the **real** target (now likely in-map)
+4. Repeats up to `_nav_max_attempts = 8` times
+
+This unlocks navigation to far-side rooms without manual exploration.
 
 ### `check_nav_status()`
-- Polls the current Nav2 action status
-- Used by the agent to decide if it should wait, replan, or escalate
+- Returns the latched last-known nav status — cheap, no polling
 
 ### `pick_up(object_label)`
-- Triggers MoveIt2 to plan and execute arm trajectory toward the object
-- Closes gripper on success
-- Returns success or failure
-- Example output:
-```json
-{ "status": "success", "object": "pen" }
-```
+- Scripted joint trajectory: open gripper → pre-grasp pose → grasp pose
+  → close gripper → lift pose
+- All poses + durations are ROS params, set by `arm_test.launch.py` for fast
+  iteration without rebuilding `agent_node`
+- Sets phase to `holding` on success
+- MoveIt2 IK-based grasping is planned but not yet wired
+
+### `list_checkpoints()` / `go_to_checkpoint(name)`
+- Named places (kitchen, desk, couch) defined in `gazebo.launch.py`
+- Spawned as no-collision visual markers in Gazebo and exported via the
+  `AIR_CHECKPOINTS` env var so the LLM sees them at startup
 
 ### `ask_user(question)`
-- Publishes a question back to the user interface
-- Used when the agent is stuck or uncertain
-- Example: *"I can see two pens, which one should I fetch?"*
+- Used when the agent is stuck or needs disambiguation
+- Example: *"I see two pens, which one should I fetch?"*
 
 ---
 
-## 3D Object Localization
+## 3D Object Localization (ground-plane projection)
 
-YOLO only gives a 2D bounding box in pixel space — it has no depth info on its
-own. To get a usable 3D position, the `localizer_node` runs a three-step chain:
+The TB3 sim's camera publishes RGB only — no depth. We get away with this
+because everything the bot picks up sits on the floor: a single ground-plane
+intersection gives a usable `(x, y)`.
 
 ```
-YOLO bounding box (pixels)
+YOLO11 bbox in pixel space
         ↓
-depth image → 3D point in camera frame
+take bbox bottom edge (where the object meets the floor)
         ↓
-tf2 transform → 3D point in map / base frame
+image_geometry.PinholeCameraModel.projectPixelTo3dRay
         ↓
-Nav2 goal / MoveIt2 target
+intersect that ray with the z=0 plane (in camera frame)
+        ↓
+tf2 transform → map frame
+        ↓
+Nav2 goal
 ```
 
-**Step 1 — Pixel → camera frame**
-The RGB-D camera (simulated in Gazebo as an Intel RealSense) publishes both
-`/camera/image_raw` and `/camera/depth/image_raw`. The localizer takes the
-center pixel of YOLO's bounding box, looks up its depth value, and uses
-`image_geometry` to back-project it into a 3D point in the camera's own frame
-— e.g. *"1.2m ahead, 0.1m to the left, relative to the camera."*
+Notable quirks fixed along the way:
 
-**Step 2 — Camera frame → world frame**
-`tf2` maintains live transforms between every frame on the robot — camera,
-base, arm, map. The localizer calls tf2 to convert the camera-frame point into
-whichever frame is needed:
-
-- **Map frame** → passed to Nav2 so it can plan a path to the object
-- **Robot base frame** → passed to MoveIt2 so the arm knows where to reach
-
-**No global GPS or world coordinates are needed.** The robot only ever needs
-to know where the object is *relative to itself*, and tf2 handles that
-continuously as the robot moves.
-
-> **Gazebo note:** The TurtleBot3 Manipulation simulation includes an RGB-D
-> camera plugin by default, so depth data is available out of the box — no
-> extra setup required.
+- **Camera `frame_id`** — the sim publishes `base_footprint` instead of the
+  real optical frame, breaking tf lookups. Overridden in code to
+  `camera_rgb_optical_frame`.
+- **Use bbox bottom, not center** — projecting the bbox center assumes the
+  object floats; on small objects this overshoots by ~1m. Bottom edge gives
+  the floor contact point.
 
 ---
 
 ## Example Agent Run
 
-**Voice command:** *"fetch the pen"*
+**Command:** *"fetch the pen"*
 
 ```
-1. Agent receives: "fetch the pen"
-
-2. Agent calls: scan_scene()
-   → detects: pen (0.91) at (1.2, 0.4), eraser (0.87) at (0.8, 0.6)
-
-3. Agent reasons: command matches "pen", one pen detected, navigate to it
-
-4. Agent calls: navigate_to({ x: 1.2, y: 0.4 })
-   → status: failed, path blocked at (1.1, 0.3)
-
-5. Agent reasons: blocked, try approaching from a different angle
-
-6. Agent calls: navigate_to({ x: 1.2, y: 0.2 })
-   → status: success
-
-7. Agent calls: scan_scene()
-   → confirms pen still visible and reachable
-
-8. Agent calls: pick_up("pen")
-   → status: success
-
-9. Agent reports: "I've fetched the pen."
+1. user_msg → agent
+2. agent → scan_scene()              → pen at (1.2, 0.4)
+3. agent → navigate_to([(1.2, 0.4)], stop_distance=0.40)
+                                     → phase: navigating
+4. (Nav2 fails: off costmap)
+   agent_node retries midpoint       → success
+   agent_node retries real target    → success
+   nav_done pushed to queue          → phase: idle
+5. agent → scan_scene()              → confirms pen still visible
+6. agent → pick_up("pen")            → phase: holding
+7. agent → go_to_checkpoint("desk")  → phase: navigating
+   ... nav_done ...                  → phase: holding
+8. agent → "I've brought the pen to the desk."
 ```
 
 ---
 
 ## ROS2 Node Summary
 
-| Node | Role | Subscribes | Publishes / Actions |
-|---|---|---|---|
-| `speech_node` | Captures voice input | mic / text input | `/speech/raw_command` |
-| `agent_node` | LLM agent + tool orchestration | `/speech/raw_command` | calls all tools |
-| `yolo_node` | YOLOv8 object detection | `/camera/image_raw` `/camera/depth/image_raw` | `/yolo/detections` |
-| `localizer_node` | Pixel → 3D position via depth + tf2 | `/yolo/detections` `/camera/depth/image_raw` | `/task/target_pose` |
-| `nav2` | Base navigation | `/task/target_pose` | `/cmd_vel` |
-| `moveit2` | Arm motion planning | arm goal from agent | `/joint_trajectory_controller` |
+| Node           | Role                                          | Notes                                  |
+|----------------|-----------------------------------------------|----------------------------------------|
+| `agent_node`   | LLM agent + tool orchestration + projection   | All ROS-side logic lives here          |
+| `nav2`         | Base navigation                               | `allow_unknown: true`, `xy_goal_tolerance: 0.10` (patched at launch) |
+| `slam_toolbox` | Online async SLAM                             | Builds the map as the bot drives       |
+| `move_group`   | MoveIt2 (planned use for grasp IK)            | Launched but not yet driven by pick_up |
+| (speech)       | Voice → text                                  | Stubbed; text input goes straight to `/agent/user` |
 
 ---
 
 ## Tech Stack
 
-| Layer | Tool |
-|---|---|
-| Robot | TurtleBot3 + OpenManipulator |
-| Simulator | Gazebo (via The Construct) |
-| Visualizer | RViz2 |
-| ROS Version | ROS2 Humble |
-| Object Detection | YOLOv8 via `yolov8_ros` |
-| 3D Localization | `image_geometry` + `tf2` |
-| LLM Agent | LangChain + Claude / GPT (tool calling) |
-| Agent Tools | ROS2 actions + services wrapped as LangChain tools |
+| Layer            | Tool                                                      |
+|------------------|-----------------------------------------------------------|
+| Robot            | TurtleBot3 Waffle Pi + OpenManipulator-X (4-DOF)          |
+| Simulator        | Gazebo Classic 11                                         |
+| ROS Version      | ROS 2 Humble                                              |
+| Object Detection | YOLO11 (`imgsz=1280`)                                     |
+| 3D Localization  | `image_geometry` ground-plane projection + `tf2`          |
+| Navigation       | Nav2 (NavfnPlanner + DWBLocalPlanner) + slam_toolbox      |
+| Manipulation     | ros2_control FollowJointTrajectory + GripperCommand; MoveIt2 wired (IK use TBD) |
+| LLM Agent        | Groq Llama 3.3-70B via LangGraph                          |
+| Agent Tools      | Python functions wrapped as LangGraph tools, calling ROS  |
 
 ---
 
 ## What the Agent Handles
 
-| Situation | Agent Behaviour |
-|---|---|
-| Object found, path clear | Navigate → pick up |
-| Multiple matching objects | Picks closest, or asks user |
-| Object not detected | Asks user to clarify or reposition |
-| Nav2 blocked | Replans with different approach angle |
-| Pick up fails | Retries once, then asks user |
-| Ambiguous command | Asks user before acting |
+| Situation                       | Behaviour                                                       |
+|---------------------------------|-----------------------------------------------------------------|
+| Object found, path clear        | Navigate (with stop_distance) → pick_up                         |
+| Multiple matching objects       | Picks closest or asks the user                                  |
+| Object not detected             | Asks the user to clarify or reposition                          |
+| Nav2 goal in unmapped space     | Auto midpoint-retry, up to 8 attempts                           |
+| Nav2 fully blocked              | Reports failure, falls back to ask_user                         |
+| Pick up fails                   | Currently: reports failure; retry policy TBD                    |
+| Ambiguous command               | Asks the user before acting                                     |
 
 ---
 
-> **Simulation note:** Voice input can be replaced with a simple text publisher
-> during development — publish directly to `/speech/raw_command` to test the
-> full agent loop without needing a microphone setup.
+## Known issues / in progress
+
+- **Gazebo grasp physics** — closed gripper doesn't reliably hold small
+  objects; they squirt out. Buehler's `gazebo_grasp_plugin` is ROS 1 only,
+  so the plan is `gazebo_ros_link_attacher` (community-maintained, has ROS 2
+  forks) — call `/ATTACHLINK` after the gripper closes, `/DETACHLINK` on
+  release.
+- **MoveIt2** — `move_group` is launched but `pick_up` still uses scripted
+  joint poses. Swap to IK-based planning is queued.
+- **Arm vs base mass** — fast trajectories flip the light base. Durations
+  currently padded (5/4/6s) until the grasp plugin lands.
+
+---
+
+## Iterating on the arm
+
+`arm_test.launch.py` + `run_arm_test.sh` bring up Gazebo + the bot + a single
+coke can at arm's reach, with `AIR_LLM_ENABLED=0` so `pick_up()` fires once
+at startup. All grasp poses and durations are declared as launch params at
+the top of `arm_test.launch.py` — edit, relaunch, watch the arm. No rebuild
+needed unless you touched Python sources.
+
+---
+
+> **Simulation note:** Voice input is stubbed during development — publish
+> text directly to `/agent/user` to drive the full agent loop without a
+> microphone setup.
