@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!--
+  Wrapper that pulls in the upstream TurtleBot3 Manipulation URDF unchanged
+  and bolts a Gazebo vacuum-gripper plugin onto end_effector_link.
+
+  Why: Gazebo Classic's finger-contact physics doesn't reliably hold small
+  objects between the OpenManipulator-X gripper pads — they squirt out the
+  moment the fingers close. The vacuum plugin sidesteps that by creating a
+  fixed joint to anything within max_distance of the link when the suction
+  is switched on. We toggle it via /vacuum_gripper/switch (std_srvs/SetBool)
+  from agent_node's pick_up() right after the gripper closes.
+
+  All upstream xacro args are forwarded so this stays drop-in compatible.
+-->
+<robot name="turtlebot3_manipulation_system" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="prefix"               default=""/>
+  <xacro:arg name="use_sim"              default="true"/>
+  <xacro:arg name="use_fake_hardware"    default="false"/>
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+
+  <xacro:include filename="$(find turtlebot3_manipulation_description)/urdf/turtlebot3_manipulation.urdf.xacro"/>
+
+  <gazebo reference="end_effector_link">
+    <plugin name="vacuum_gripper" filename="libgazebo_ros_vacuum_gripper.so">
+      <ros>
+        <remapping>grasping:=vacuum_gripper/grasping</remapping>
+        <remapping>switch:=vacuum_gripper/switch</remapping>
+      </ros>
+      <link_name>end_effector_link</link_name>
+      <max_distance>0.05</max_distance>
+    </plugin>
+  </gazebo>
+
+</robot>

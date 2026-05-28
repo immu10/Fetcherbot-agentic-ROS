@@ -14,6 +14,9 @@ setup(
             "launch/gazebo.launch.py",
             "launch/arm_test.launch.py",
         ]),
+        (f"share/{package_name}/urdf", [
+            "urdf/air_robot.urdf.xacro",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

@@ -9,6 +9,9 @@ gazebo.launch.py:
     relaunch to iterate without touching agent_node.py.
   - LLM is forced off here too (env var) so pick_up fires once at startup via
     run_scan_only_loop.
+  - Robot is spawned from OUR wrapper xacro (urdf/air_robot.urdf.xacro) which
+    injects the gazebo_ros_vacuum_gripper plugin onto end_effector_link, so
+    pick_up can call /vacuum_gripper/switch to actually hold the can.
 
 Iterate flow:
   1. Edit POSE_* / DUR_* below.
@@ -17,19 +20,13 @@ Iterate flow:
   3. Watch the arm in Gazebo.
 """
 
-import os
-import tempfile
-
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
+from launch.actions import IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, TimerAction
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import Command, FindExecutable, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
-
-TB3_SIM_PACKAGE = "turtlebot3_manipulation_gazebo"
-TB3_SIM_LAUNCH  = "gazebo.launch.py"
 
 
 # ============================================================================
@@ -67,20 +64,86 @@ def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
 
 
 def generate_launch_description():
-    # Gazebo + bot + ros2_control (same as the full launch).
-    sim_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
+    # ----- URDF from OUR wrapper xacro (injects the vacuum plugin) -----
+    # Same xacro args base.launch.py passes upstream — kept identical so the
+    # controllers, hardware interfaces, and Gazebo bits all match.
+    robot_description = {
+        "robot_description": Command([
+            PathJoinSubstitution([FindExecutable(name="xacro")]),
+            " ",
             PathJoinSubstitution([
-                FindPackageShare(TB3_SIM_PACKAGE), "launch", TB3_SIM_LAUNCH,
-            ])
-        ),
+                FindPackageShare("air"), "urdf", "air_robot.urdf.xacro",
+            ]),
+            " ", "prefix:=",               '""',
+            " ", "use_sim:=",              "true",
+            " ", "use_fake_hardware:=",    "false",
+            " ", "fake_sensor_commands:=", "false",
+        ])
+    }
+
+    # ----- robot_state_publisher with our patched URDF -----
+    rsp_node = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        parameters=[robot_description, {"use_sim_time": True}],
+        output="screen",
     )
 
-    # MoveIt2 move_group — adds IK + motion planning on top of the controllers
-    # we already have running. Includes from the upstream config package. We
-    # rely on the sim already having published /robot_description and bringing
-    # up /joint_states via ros2_control, so we only need the brain, not the
-    # full Gazebo-tied launch.
+    # ----- Gazebo (gzserver + gzclient) via gazebo_ros -----
+    gazebo_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("gazebo_ros"), "launch", "gazebo.launch.py",
+            ])
+        ),
+        launch_arguments={"verbose": "false"}.items(),
+    )
+
+    # ----- Spawn the bot from /robot_description -----
+    spawn_robot = Node(
+        package="gazebo_ros",
+        executable="spawn_entity.py",
+        arguments=[
+            "-topic", "robot_description",
+            "-entity", "turtlebot3_manipulation_system",
+            "-x", "-2.00", "-y", "-0.50", "-z", "0.01",
+        ],
+        output="screen",
+    )
+
+    # ----- Controller spawners (mirrors base.launch.py upstream) -----
+    # joint_state_broadcaster first; the others chain off its exit so they
+    # only start once the controller_manager has it loaded.
+    jsb_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+        output="screen",
+    )
+    arm_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["arm_controller"],
+        output="screen",
+    )
+    gripper_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["gripper_controller"],
+        output="screen",
+    )
+    imu_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["imu_broadcaster"],
+        output="screen",
+    )
+
+    chain_arm     = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[arm_spawner]))
+    chain_gripper = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[gripper_spawner]))
+    chain_imu     = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[imu_spawner]))
+
+    # ----- MoveIt2 move_group -----
     move_group_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -90,18 +153,13 @@ def generate_launch_description():
         ),
         launch_arguments={"use_sim_time": "true"}.items(),
     )
-    # Delay enough that sim + controllers are up first; MoveIt needs them.
     delayed_move_group = TimerAction(period=9.0, actions=[move_group_launch])
 
-    # Test object ~30 cm in front of the bot. coke_can (cylinder) instead of
-    # cricket_ball (sphere) — Gazebo's contact solver doesn't blow up against
-    # flat-based objects.
+    # ----- Test object ~30 cm in front of the bot -----
     obj = _spawn_db("test_obj", "coke_can", x=-1.7, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
-    # agent_node — launched directly (not via agent.launch.py) so we can pass
-    # the tuning overrides as parameters. With AIR_LLM_ENABLED=0 (forced
-    # below) the scan-only loop fires pick_up() once at startup.
+    # ----- agent_node with tuning overrides -----
     agent_node = Node(
         package="air",
         executable="agent_node",
@@ -124,7 +182,13 @@ def generate_launch_description():
         # Force LLM off — pick_up runs automatically on startup via the
         # scan-only loop. Matches what run_arm_test.sh exports.
         SetEnvironmentVariable("AIR_LLM_ENABLED", "0"),
-        sim_launch,
+        rsp_node,
+        gazebo_launch,
+        spawn_robot,
+        jsb_spawner,
+        chain_arm,
+        chain_gripper,
+        chain_imu,
         delayed_obj,
         delayed_move_group,
         delayed_agent,

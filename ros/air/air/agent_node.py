@@ -46,6 +46,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from control_msgs.action import FollowJointTrajectory, GripperCommand
+from std_srvs.srv import SetBool
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from cv_bridge import CvBridge
@@ -317,6 +318,12 @@ class AgentNode(Node):
         self._gripper_client = ActionClient(
             self, GripperCommand, "/gripper_controller/gripper_cmd",
         )
+
+        # Vacuum-gripper plugin (gazebo_ros_vacuum_gripper) is injected onto
+        # end_effector_link via urdf/air_robot.urdf.xacro. We toggle suction
+        # from pick_up() right after the fingers close — Gazebo's contact
+        # solver can't reliably hold small objects between the pads otherwise.
+        self._vacuum_client = self.create_client(SetBool, "/vacuum_gripper/switch")
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
@@ -984,6 +991,9 @@ class AgentNode(Node):
             self._send_arm_pose(pose_pre_grasp, duration_s=dur_pre_grasp)
             self._send_arm_pose(pose_grasp,     duration_s=dur_grasp)
             self._send_gripper(g_closed)
+            # Fingers are touching the object now — flip the suction ON before
+            # we lift so Gazebo's vacuum plugin welds it to end_effector_link.
+            self._set_vacuum(True)
             self._send_arm_pose(pose_lift,      duration_s=dur_lift)
         except Exception as e:
             return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
@@ -1047,6 +1057,30 @@ class AgentNode(Node):
             time.sleep(0.05)
         if not result_fut.done():
             raise RuntimeError("gripper result timed out")
+
+    def _set_vacuum(self, on: bool) -> None:
+        """Toggle the Gazebo vacuum-gripper plugin via /vacuum_gripper/switch.
+
+        Non-fatal: if the service isn't up (e.g. running outside Gazebo, or
+        the URDF wasn't patched), log a warning and move on so pick_up still
+        completes. The fingers will have closed either way; we just won't get
+        the magic hold.
+        """
+        if not self._vacuum_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(
+                "vacuum: /vacuum_gripper/switch unavailable — "
+                "plugin may not be loaded (check air_robot.urdf.xacro)"
+            )
+            return
+        req = SetBool.Request()
+        req.data = bool(on)
+        self.get_logger().info(f"vacuum → {'ON' if on else 'OFF'}")
+        fut = self._vacuum_client.call_async(req)
+        deadline = time.time() + 2.0
+        while not fut.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not fut.done():
+            self.get_logger().warn("vacuum: switch service call timed out")
 
     def ask_user(self, question: str) -> dict:
         """Publish a question, block until /agent/user comes back (or timeout).
