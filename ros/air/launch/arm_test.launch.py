@@ -32,6 +32,7 @@ from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -95,7 +96,10 @@ def generate_launch_description():
         package="robot_state_publisher",
         executable="robot_state_publisher",
         output="screen",
-        parameters=[{"robot_description": urdf_file, "use_sim_time": True}],
+        parameters=[{
+            "robot_description": ParameterValue(urdf_file, value_type=str),
+            "use_sim_time": True,
+        }],
     )
 
     # Gazebo server + client (empty world is fine for arm tuning).
