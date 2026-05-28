@@ -4,14 +4,15 @@ Stripped-down launch for tuning the scripted pick_up routine. Differences from
 gazebo.launch.py:
   - No Nav2, no SLAM, no RViz, no named checkpoints.
   - Test object spawned ~30 cm in front of the bot — right at arm's reach.
+  - Bot is spawned from OUR wrapper xacro (urdf/air_robot.urdf.xacro) which
+    pulls in the upstream TB3 manipulation URDF and bolts a Gazebo vacuum-
+    gripper plugin onto end_effector_link. This sidesteps Gazebo Classic's
+    broken finger contact — objects stick to the tip when the suction is on.
   - agent_node still comes up, BUT with tuning overrides for pick_up poses
     and durations declared right here in this file. Edit those values and
     relaunch to iterate without touching agent_node.py.
   - LLM is forced off here too (env var) so pick_up fires once at startup via
     run_scan_only_loop.
-  - Robot is spawned from OUR wrapper xacro (urdf/air_robot.urdf.xacro) which
-    injects the gazebo_ros_vacuum_gripper plugin onto end_effector_link, so
-    pick_up can call /vacuum_gripper/switch to actually hold the can.
 
 Iterate flow:
   1. Edit POSE_* / DUR_* below.
@@ -21,7 +22,12 @@ Iterate flow:
 """
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, TimerAction
+from launch.actions import (
+    IncludeLaunchDescription,
+    RegisterEventHandler,
+    SetEnvironmentVariable,
+    TimerAction,
+)
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, PathJoinSubstitution
@@ -64,32 +70,35 @@ def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
 
 
 def generate_launch_description():
-    # ----- URDF from OUR wrapper xacro (injects the vacuum plugin) -----
-    # Same xacro args base.launch.py passes upstream — kept identical so the
-    # controllers, hardware interfaces, and Gazebo bits all match.
-    robot_description = {
-        "robot_description": Command([
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
-            " ",
-            PathJoinSubstitution([
-                FindPackageShare("air"), "urdf", "air_robot.urdf.xacro",
-            ]),
-            " ", "prefix:=",               '""',
-            " ", "use_sim:=",              "true",
-            " ", "use_fake_hardware:=",    "false",
-            " ", "fake_sensor_commands:=", "false",
-        ])
-    }
+    # ---- patched URDF (upstream xacro + vacuum plugin) -------------------
+    # We can't include turtlebot3_manipulation_gazebo's gazebo.launch.py
+    # wholesale because it spawns the stock URDF — no suction. Instead
+    # replicate what base.launch.py + that gazebo launch do, but feed
+    # robot_state_publisher OUR wrapper xacro. Net effect: the spawned model
+    # has the vacuum plugin on end_effector_link, exposing
+    # /vacuum_gripper/switch (std_srvs/SetBool) which pick_up() toggles.
+    urdf_file = Command([
+        PathJoinSubstitution([FindExecutable(name="xacro")]),
+        " ",
+        PathJoinSubstitution([FindPackageShare("air"), "urdf", "air_robot.urdf.xacro"]),
+        " ",
+        "prefix:=",               '""',
+        " ",
+        "use_sim:=",              "true",
+        " ",
+        "use_fake_hardware:=",    "false",
+        " ",
+        "fake_sensor_commands:=", "false",
+    ])
 
-    # ----- robot_state_publisher with our patched URDF -----
-    rsp_node = Node(
+    robot_state_pub = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
-        parameters=[robot_description, {"use_sim_time": True}],
         output="screen",
+        parameters=[{"robot_description": urdf_file, "use_sim_time": True}],
     )
 
-    # ----- Gazebo (gzserver + gzclient) via gazebo_ros -----
+    # Gazebo server + client (empty world is fine for arm tuning).
     gazebo_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -99,21 +108,22 @@ def generate_launch_description():
         launch_arguments={"verbose": "false"}.items(),
     )
 
-    # ----- Spawn the bot from /robot_description -----
-    spawn_robot = Node(
+    # Spawn the bot from the URDF we just published on /robot_description.
+    spawn_bot = Node(
         package="gazebo_ros",
         executable="spawn_entity.py",
+        output="screen",
         arguments=[
             "-topic", "robot_description",
             "-entity", "turtlebot3_manipulation_system",
             "-x", "-2.00", "-y", "-0.50", "-z", "0.01",
         ],
-        output="screen",
     )
 
-    # ----- Controller spawners (mirrors base.launch.py upstream) -----
-    # joint_state_broadcaster first; the others chain off its exit so they
-    # only start once the controller_manager has it loaded.
+    # ---- controllers (chained off joint_state_broadcaster's success) -----
+    # Mirrors upstream base.launch.py exactly. In sim mode the ros2_control_node
+    # is NOT standalone — gazebo_ros2_control loads inside Gazebo from the
+    # URDF's <plugin> block, so we only need the spawners here.
     jsb_spawner = Node(
         package="controller_manager",
         executable="spawner",
@@ -139,11 +149,12 @@ def generate_launch_description():
         output="screen",
     )
 
-    chain_arm     = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[arm_spawner]))
-    chain_gripper = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[gripper_spawner]))
-    chain_imu     = RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[imu_spawner]))
+    def after_jsb(spawner):
+        return RegisterEventHandler(
+            event_handler=OnProcessExit(target_action=jsb_spawner, on_exit=[spawner])
+        )
 
-    # ----- MoveIt2 move_group -----
+    # ---- MoveIt2 move_group (kept; harmless if pick_up doesn't use it yet) -
     move_group_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -155,11 +166,16 @@ def generate_launch_description():
     )
     delayed_move_group = TimerAction(period=9.0, actions=[move_group_launch])
 
-    # ----- Test object ~30 cm in front of the bot -----
+    # ---- Test object ~30 cm in front of the bot --------------------------
+    # coke_can (cylinder) instead of cricket_ball (sphere) — Gazebo's contact
+    # solver doesn't blow up against flat-based objects.
     obj = _spawn_db("test_obj", "coke_can", x=-1.7, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
-    # ----- agent_node with tuning overrides -----
+    # ---- agent_node ------------------------------------------------------
+    # Launched directly (not via agent.launch.py) so we can pass tuning
+    # overrides as parameters. With AIR_LLM_ENABLED=0 (set below) the scan-
+    # only loop fires pick_up() once at startup.
     agent_node = Node(
         package="air",
         executable="agent_node",
@@ -182,13 +198,13 @@ def generate_launch_description():
         # Force LLM off — pick_up runs automatically on startup via the
         # scan-only loop. Matches what run_arm_test.sh exports.
         SetEnvironmentVariable("AIR_LLM_ENABLED", "0"),
-        rsp_node,
+        robot_state_pub,
         gazebo_launch,
-        spawn_robot,
+        spawn_bot,
         jsb_spawner,
-        chain_arm,
-        chain_gripper,
-        chain_imu,
+        after_jsb(arm_spawner),
+        after_jsb(gripper_spawner),
+        after_jsb(imu_spawner),
         delayed_obj,
         delayed_move_group,
         delayed_agent,
