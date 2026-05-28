@@ -53,15 +53,15 @@ from image_geometry import PinholeCameraModel
 from tf2_ros import Buffer, TransformListener
 
 # Import the standalone YOLO loader from the project's OD module so we don't
-# duplicate model config. OD.py lives at the repo root, which is several dirs
-# above this file. Walk upward looking for it, then prepend that dir to
-# sys.path — no PYTHONPATH export required, works under both colcon
-# --symlink-install (realpath resolves through the symlink) and a plain copy
-# install. Falls back to leaving OD as None so scan_scene can report cleanly.
+# duplicate model config. OD.py lives in <repo>/folderName/, which is several
+# dirs above this file. Walk upward looking for that folder, then prepend BOTH
+# the repo root (so .env etc. resolve) and folderName/ (so `import OD` works)
+# to sys.path. Works under both colcon --symlink-install and plain copy install.
+# Falls back to leaving OD as None so scan_scene can report cleanly.
 def _find_repo_root_with_OD(start: str, max_depth: int = 8) -> Optional[str]:
     here = os.path.dirname(os.path.realpath(start))
     for _ in range(max_depth):
-        if os.path.isfile(os.path.join(here, "OD.py")):
+        if os.path.isfile(os.path.join(here, "folderName", "OD.py")):
             return here
         parent = os.path.dirname(here)
         if parent == here:
@@ -71,8 +71,12 @@ def _find_repo_root_with_OD(start: str, max_depth: int = 8) -> Optional[str]:
 
 
 _repo_root = _find_repo_root_with_OD(__file__)
-if _repo_root and _repo_root not in sys.path:
-    sys.path.insert(0, _repo_root)
+if _repo_root:
+    _od_dir = os.path.join(_repo_root, "folderName")
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    if _od_dir not in sys.path:
+        sys.path.insert(0, _od_dir)
 
 # Load .env from the repo root so AIR_LLM_ENABLED, AIR_LLM_DEBUG, GROQ_API_KEY
 # etc. are visible to this process. Topic env vars (AIR_RGB_TOPIC, ...) are
@@ -222,8 +226,8 @@ class AgentNode(Node):
         else:
             if _repo_root is None:
                 self.get_logger().warn(
-                    "OD module not importable: could not auto-locate OD.py by "
-                    "walking up from this file. Is OD.py still at the project root?"
+                    "OD module not importable: could not auto-locate folderName/OD.py "
+                    "by walking up from this file. Has it moved?"
                 )
             else:
                 self.get_logger().warn(
