@@ -1,3 +1,6 @@
+bleh
+
+
 # Robot Pipeline Flow
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
 
@@ -215,30 +218,6 @@ Notable quirks fixed along the way:
 
 ---
 
-## Known issues / in progress
-
-- **Gazebo grasp physics** — closed gripper doesn't reliably hold small
-  objects; they squirt out. Buehler's `gazebo_grasp_plugin` is ROS 1 only,
-  so the plan is `gazebo_ros_link_attacher` (community-maintained, has ROS 2
-  forks) — call `/ATTACHLINK` after the gripper closes, `/DETACHLINK` on
-  release.
-- **MoveIt2** — `move_group` is launched but `pick_up` still uses scripted
-  joint poses. Swap to IK-based planning is queued.
-- **Arm vs base mass** — fast trajectories flip the light base. Durations
-  currently padded (5/4/6s) until the grasp plugin lands.
-
----
-
-## Iterating on the arm
-
-`arm_test.launch.py` + `run_arm_test.sh` bring up Gazebo + the bot + a single
-coke can at arm's reach, with `AIR_LLM_ENABLED=0` so `pick_up()` fires once
-at startup. All grasp poses and durations are declared as launch params at
-the top of `arm_test.launch.py` — edit, relaunch, watch the arm. No rebuild
-needed unless you touched Python sources.
-
----
-
-> **Simulation note:** Voice input is stubbed during development — publish
-> text directly to `/agent/user` to drive the full agent loop without a
-> microphone setup.
+> **Simulation note:** Voice input can be replaced with a simple text publisher
+> during development — publish directly to `/speech/raw_command` to test the
+> full agent loop without needing a microphone setup.
