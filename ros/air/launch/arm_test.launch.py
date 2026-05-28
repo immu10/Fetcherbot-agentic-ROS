@@ -102,14 +102,18 @@ def generate_launch_description():
         }],
     )
 
-    # Gazebo server + client (empty world is fine for arm tuning).
+    # Gazebo server + client. Pass the same world the upstream TB3 wrapper
+    # uses — bare gazebo_ros default is pitch black (no sun, no ground plane).
+    world_file = PathJoinSubstitution([
+        FindPackageShare("turtlebot3_gazebo"), "worlds", "turtlebot3_world.world",
+    ])
     gazebo_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare("gazebo_ros"), "launch", "gazebo.launch.py",
             ])
         ),
-        launch_arguments={"verbose": "false"}.items(),
+        launch_arguments={"verbose": "false", "world": world_file}.items(),
     )
 
     # Spawn the bot from the URDF we just published on /robot_description.
