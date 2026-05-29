@@ -1109,10 +1109,10 @@ class AgentNode(Node):
         """Begin teleporting `entity_name` to end_effector_link's world pose at
         ~30 Hz. Idempotent — calling twice replaces the prior target.
         """
-        if not self._set_entity_state_client.wait_for_service(timeout_sec=1.0):
+        if not self._set_entity_state_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn("fake-attach: /gazebo/set_entity_state unavailable; skipping")
             return
-        if not self._get_entity_state_client.wait_for_service(timeout_sec=1.0):
+        if not self._get_entity_state_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn("fake-attach: /gazebo/get_entity_state unavailable; skipping")
             return
         self._fake_attach_target = entity_name
