@@ -22,6 +22,7 @@ setup(
         ]),
         (f"share/{package_name}/models", [
             "models/test_can.sdf",
+            "models/test_ball.sdf",
         ]),
     ],
     install_requires=["setuptools"],

@@ -1,0 +1,47 @@
+<?xml version="1.0" ?>
+<!--
+  Test object for arm_test: a ball. Same fake-attach contract as test_can:
+  gravity off + collide_bitmask 0x00 so the pose-snap loop can teleport it
+  through the bot without the contact solver retaliating, and so it doesn't
+  fall through the (also non-colliding-with-it) ground when the pin isn't
+  active.
+
+  4 cm radius — bigger than the coke can's 33 mm so it's clearly distinct
+  in the viewport while iterating. Color is bright green so YOLO has the
+  best chance of triggering "sports ball" (COCO class) once we point a
+  camera at it.
+-->
+<sdf version="1.6">
+  <model name="test_obj">
+    <link name="link">
+      <gravity>0</gravity>
+      <inertial>
+        <mass>0.15</mass>
+        <inertia>
+          <ixx>0.0001</ixx><iyy>0.0001</iyy><izz>0.0001</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <sphere><radius>0.04</radius></sphere>
+        </geometry>
+        <surface>
+          <contact>
+            <collide_bitmask>0x00</collide_bitmask>
+          </contact>
+        </surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <sphere><radius>0.04</radius></sphere>
+        </geometry>
+        <material>
+          <ambient>0.1 0.7 0.1 1</ambient>
+          <diffuse>0.15 0.85 0.15 1</diffuse>
+          <specular>0.3 0.3 0.3 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

@@ -104,10 +104,13 @@ def generate_launch_description():
     # collisions enabled, the contact solver fights the snap and launches
     # the bot. Our test_can.sdf is a coke-can-sized cylinder with collision
     # bitmask 0x00 so it never registers contacts with anything.
-    test_can_sdf = PathJoinSubstitution([
-        FindPackageShare("air"), "models", "test_can.sdf",
+    # Swap test_can.sdf ↔ test_ball.sdf (or any future test_*.sdf) here to
+    # iterate on object types. Both share the same fake-attach contract:
+    # collision bitmask 0x00, gravity off, model name "test_obj".
+    test_obj_sdf = PathJoinSubstitution([
+        FindPackageShare("air"), "models", "test_ball.sdf",
     ])
-    obj = _spawn_file("test_obj", test_can_sdf, x=-1.75, y=-0.5, z=0.05)
+    obj = _spawn_file("test_obj", test_obj_sdf, x=-1.75, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
     # agent_node — launched directly (not via agent.launch.py) so we can pass
