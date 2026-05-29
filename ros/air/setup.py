@@ -17,6 +17,9 @@ setup(
         (f"share/{package_name}/urdf", [
             "urdf/air_robot.urdf.xacro",
         ]),
+        (f"share/{package_name}/worlds", [
+            "worlds/arm_test.world",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

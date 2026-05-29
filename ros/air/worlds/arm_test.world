@@ -1,0 +1,30 @@
+<?xml version="1.0" ?>
+<!--
+  Minimal world for arm_test. Same as Gazebo's default empty world (ground +
+  sun) PLUS the gazebo_ros_state plugin, which exposes /gazebo/get_entity_state
+  and /gazebo/set_entity_state. agent_node's fake-attach loop teleports the
+  picked object to end_effector_link via those services; without this plugin
+  loaded into the world, the services don't exist and fake-attach silently
+  no-ops (every tick early-returns on service_is_ready()==False).
+
+  We deliberately do NOT reuse turtlebot3_world.world — arm_test only needs
+  flat ground for the can and bot. The maze adds nothing here.
+-->
+<sdf version="1.6">
+  <world name="default">
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/gazebo</namespace>
+      </ros>
+      <update_rate>30.0</update_rate>
+    </plugin>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+  </world>
+</sdf>

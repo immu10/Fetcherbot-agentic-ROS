@@ -64,13 +64,22 @@ def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
 
 
 def generate_launch_description():
-    # Gazebo + bot + ros2_control (same as the full launch).
+    # Gazebo + bot + ros2_control (same as the full launch), BUT with our own
+    # world file. Upstream's default (turtlebot3_world.world) doesn't load the
+    # gazebo_ros_state plugin, so /gazebo/get_entity_state and
+    # /gazebo/set_entity_state never exist and fake-attach silently no-ops.
+    # Our world is empty ground + sun + that plugin — nothing else needed for
+    # the scripted pick_up tuning loop.
+    arm_test_world = PathJoinSubstitution([
+        FindPackageShare("air"), "worlds", "arm_test.world",
+    ])
     sim_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare(TB3_SIM_PACKAGE), "launch", TB3_SIM_LAUNCH,
             ])
         ),
+        launch_arguments={"world": arm_test_world}.items(),
     )
 
     # MoveIt2 move_group — adds IK + motion planning on top of the controllers
