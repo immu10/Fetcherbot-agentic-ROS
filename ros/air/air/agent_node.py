@@ -1000,7 +1000,7 @@ class AgentNode(Node):
             # can falls there, you know that pinch level wasn't firm enough.
             steps        = 20
             close_total_s = 20.0    # 1s per step
-            check_after  = 17       # first check fires at tick 18
+            check_after  = 18       # first check fires at tick 19
             check_lift_delta = -0.15  # joint2 delta ≈ ~2 cm up (smaller joint2 = higher arm)
             check_dur    = 1.5      # seconds for the up move and the down move
             for i in range(1, steps + 1):
