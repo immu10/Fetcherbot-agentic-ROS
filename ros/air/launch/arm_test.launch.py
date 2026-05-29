@@ -140,9 +140,9 @@ def generate_launch_description():
     # zone (~(-1.75, -0.5)) with the three objects spread sideways so the
     # camera sees all three at once.
     yolo_spawns = [
-        _spawn_db("coke", "coke_can",     x=-1.60, y=-0.30, z=0.05),
-        _spawn_db("cup",  "plastic_cup",  x=-1.60, y=-0.50, z=0.05),
-        _spawn_db("ball", "cricket_ball", x=-1.60, y=-0.70, z=0.05),
+        _spawn_db("bottle", "beer",         x=-1.60, y=-0.30, z=0.05),
+        _spawn_db("bowl",   "bowl",         x=-1.60, y=-0.50, z=0.05),
+        _spawn_db("ball",   "cricket_ball", x=-1.60, y=-0.70, z=0.05),
     ]
     delayed_obj = TimerAction(period=8.0, actions=yolo_spawns)
 
