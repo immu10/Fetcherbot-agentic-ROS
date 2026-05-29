@@ -1,0 +1,54 @@
+<?xml version="1.0" ?>
+<!--
+  Test object for arm_test. Coke-can-sized cylinder, BUT with collisions
+  disabled (<collide_bitmask>0x00</collide_bitmask>) so fake-attach can
+  teleport it through the bot every tick without the contact solver
+  retaliating by flinging the base across the world. Visual only — the
+  "grasp" is purely cosmetic and the hold is pose-snapping in agent_node.
+
+  Dimensions: 33 mm radius, 122 mm height — real coke can.
+-->
+<sdf version="1.6">
+  <model name="test_obj">
+    <link name="link">
+      <inertial>
+        <mass>0.39</mass>
+        <inertia>
+          <ixx>0.00058</ixx><iyy>0.00058</iyy><izz>0.00021</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <cylinder>
+            <radius>0.033</radius>
+            <length>0.122</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <contact>
+            <!-- 0x00 = collides with nothing. The link still has a collision
+                 shape so Gazebo's broadphase is happy, but no contact
+                 manifolds are generated against the bot, the ground, or
+                 anything else. Combined with fake-attach pose snapping
+                 this gives us a "ghost" can that just rides the wrist. -->
+            <collide_bitmask>0x00</collide_bitmask>
+          </contact>
+        </surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder>
+            <radius>0.033</radius>
+            <length>0.122</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.8 0.1 0.1 1</ambient>
+          <diffuse>0.9 0.15 0.15 1</diffuse>
+          <specular>0.2 0.2 0.2 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

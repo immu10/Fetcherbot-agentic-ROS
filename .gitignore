@@ -77,6 +77,8 @@ logs/
 *.pkl
 *.weights
 models/
+!ros/air/models/
+!ros/air/models/**
 data/
 runs/
 yolov*.pt
