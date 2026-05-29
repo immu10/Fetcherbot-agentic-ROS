@@ -353,6 +353,12 @@ class AgentNode(Node):
         # geometry — Gazebo's contact solver freaks out and ejects the can
         # at the speed of light if it overlaps the bot's collision mesh.
         self._fake_attach_offset_local = np.array([0.12, 0.0, 0.0])
+        # Extra world-frame offset applied AFTER the local-frame rotation.
+        # Used to drop the can below the wrist so it visually hangs in the
+        # open fingers instead of stacking on top of the gripper housing
+        # (which is what link5's origin is roughly level with). World-frame
+        # because "down" is gravity-down regardless of wrist orientation.
+        self._fake_attach_offset_world = np.array([0.0, 0.0, -0.05])
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
@@ -1019,8 +1025,11 @@ class AgentNode(Node):
             self._send_gripper(g_open)
             self._send_arm_pose(pose_pre_grasp, duration_s=dur_pre_grasp)
             self._send_arm_pose(pose_grasp,     duration_s=dur_grasp)
-            # Cosmetic close — the actual hold comes from fake-attach below.
-            self._send_gripper(g_closed)
+            # Gripper STAYS OPEN through the whole routine — closing pinches
+            # the can into the gripper's collision mesh, and since fake-attach
+            # teleports the can every tick, that collision explodes into
+            # Gazebo's solver and either flings the can or wedges it into the
+            # base. Open fingers + can floating in the gap = clean visual.
             # Start the teleport loop BEFORE the lift, so by the time the arm
             # starts rising the can is already being snapped to the tip each
             # tick. Hardcoded entity name for now — arm_test spawns "test_obj";
@@ -1196,9 +1205,10 @@ class AgentNode(Node):
         world_off = v + 2.0 * s * np.cross(u, v) + 2.0 * np.cross(u, np.cross(u, v))
         set_req = SetEntityState.Request()
         set_req.state.name = target
-        set_req.state.pose.position.x = resp.state.pose.position.x + float(world_off[0])
-        set_req.state.pose.position.y = resp.state.pose.position.y + float(world_off[1])
-        set_req.state.pose.position.z = resp.state.pose.position.z + float(world_off[2])
+        wo = self._fake_attach_offset_world
+        set_req.state.pose.position.x = resp.state.pose.position.x + float(world_off[0]) + float(wo[0])
+        set_req.state.pose.position.y = resp.state.pose.position.y + float(world_off[1]) + float(wo[1])
+        set_req.state.pose.position.z = resp.state.pose.position.z + float(world_off[2]) + float(wo[2])
         set_req.state.pose.orientation.x = 0.0
         set_req.state.pose.orientation.y = 0.0
         set_req.state.pose.orientation.z = 0.0
