@@ -17,6 +17,8 @@ Iterate flow:
   3. Watch the arm in Gazebo.
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -143,8 +145,13 @@ def generate_launch_description():
         # Google Research photogrammetry-scanned teddy bear from Gazebo Fuel.
         # Real-product texture → YOLO/COCO "teddy bear" is a reliable hit.
         # Requires GAZEBO_MODEL_PATH to include ~/gazebo_models.
-        _spawn_db("teddy", "Lovable_Huggable_Cuddly_Boutique_Teddy_Bear_Beige",
-                  x=-1.60, y=-0.50, z=0.25),
+        # -database lookup needs GAZEBO_MODEL_PATH set in the gzserver
+        # environment, which run_arm_test.sh may not inherit. Spawning by
+        # absolute file path bypasses the lookup — hardcoded user home;
+        # adjust if you move the download elsewhere.
+        _spawn_file("teddy",
+                    os.path.expanduser("~/gazebo_models/teddy_bear/model.sdf"),
+                    x=-1.60, y=-0.50, z=0.25),
     ]
     delayed_obj = TimerAction(period=8.0, actions=yolo_spawns)
 
