@@ -345,6 +345,14 @@ class AgentNode(Node):
         # tip; close enough for the visual fake-attach. If we ever need the
         # exact tip we'd add a static offset here.
         self._fake_attach_ee = "turtlebot3_manipulation_system::link5"
+        # Static offset from link5 origin to where the can floats, expressed
+        # in link5's LOCAL frame (rotates with the wrist). +x in link5 is the
+        # gripper-forward axis on OpenManipulator-X, so a positive value puts
+        # the can in front of the wrist where the gripper would hold it.
+        # Bumped out far enough that the can doesn't intersect the gripper
+        # geometry — Gazebo's contact solver freaks out and ejects the can
+        # at the speed of light if it overlaps the bot's collision mesh.
+        self._fake_attach_offset_local = np.array([0.12, 0.0, 0.0])
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
@@ -1176,9 +1184,25 @@ class AgentNode(Node):
             p = resp.state.pose.position
             self.get_logger().info(f"fake-attach: ee pose = ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})")
             self._fake_attach_logged = True
+        # Rotate the local-frame offset into world frame using link5's
+        # orientation, then add to link5's world position. Keep the can's
+        # orientation as identity (upright) so it doesn't tumble when the
+        # wrist rotates — a coke can on its side rolling around looks worse
+        # than one floating in front of the gripper.
+        q = resp.state.pose.orientation
+        u = np.array([q.x, q.y, q.z])
+        s = q.w
+        v = self._fake_attach_offset_local
+        world_off = v + 2.0 * s * np.cross(u, v) + 2.0 * np.cross(u, np.cross(u, v))
         set_req = SetEntityState.Request()
         set_req.state.name = target
-        set_req.state.pose = resp.state.pose
+        set_req.state.pose.position.x = resp.state.pose.position.x + float(world_off[0])
+        set_req.state.pose.position.y = resp.state.pose.position.y + float(world_off[1])
+        set_req.state.pose.position.z = resp.state.pose.position.z + float(world_off[2])
+        set_req.state.pose.orientation.x = 0.0
+        set_req.state.pose.orientation.y = 0.0
+        set_req.state.pose.orientation.z = 0.0
+        set_req.state.pose.orientation.w = 1.0
         set_req.state.reference_frame = "world"
         set_fut = self._set_entity_state_client.call_async(set_req)
         # log the FIRST set response so we know if Gazebo accepted it
