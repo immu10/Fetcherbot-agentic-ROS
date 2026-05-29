@@ -1109,12 +1109,9 @@ class AgentNode(Node):
         """Begin teleporting `entity_name` to end_effector_link's world pose at
         ~30 Hz. Idempotent — calling twice replaces the prior target.
         """
-        if not self._set_entity_state_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("fake-attach: /gazebo/set_entity_state unavailable; skipping")
-            return
-        if not self._get_entity_state_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("fake-attach: /gazebo/get_entity_state unavailable; skipping")
-            return
+        # Don't block on wait_for_service — DDS discovery in WSL can take much
+        # longer than the executor will tolerate while pick_up is running. Just
+        # start the timer; each tick self-skips if the services aren't ready.
         self._fake_attach_target = entity_name
         if self._fake_attach_timer is None:
             self._fake_attach_timer = self.create_timer(1.0 / 30.0, self._fake_attach_tick)
@@ -1130,10 +1127,14 @@ class AgentNode(Node):
 
     def _fake_attach_tick(self) -> None:
         """Timer callback: fetch end-effector world pose, push to target object.
-        Both calls are async with done callbacks — never blocks the timer."""
+        Both calls are async with done callbacks — never blocks the timer.
+        Self-skips silently until both Gazebo state services are discovered."""
         target = self._fake_attach_target
         if not target:
             return
+        if not (self._get_entity_state_client.service_is_ready() and
+                self._set_entity_state_client.service_is_ready()):
+            return  # services not discovered yet — try next tick
         req = GetEntityState.Request()
         req.name = self._fake_attach_ee
         req.reference_frame = "world"
