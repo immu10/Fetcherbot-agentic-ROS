@@ -1154,7 +1154,16 @@ class AgentNode(Node):
             self.get_logger().warn("fake-attach: get returned None")
             return
         if not resp.success:
-            self.get_logger().warn("fake-attach: get success=False (bad link name?)")
+            # Throttle: at 30 Hz this floods the log. Warn once, then stop the
+            # timer — bad link name won't fix itself on retry.
+            if not getattr(self, "_fake_attach_get_failed_logged", False):
+                self.get_logger().warn(
+                    f"fake-attach: get success=False for '{self._fake_attach_ee}' "
+                    "(bad model::link name?). Stopping fake-attach. "
+                    "Run: ros2 topic echo /gazebo/model_states --once  to find the right name."
+                )
+                self._fake_attach_get_failed_logged = True
+            self._stop_fake_attach()
             return
         # One-time log of the first successful read so we can confirm pose looks sane.
         if not getattr(self, "_fake_attach_logged", False):
