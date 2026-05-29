@@ -1,28 +1,41 @@
 <?xml version="1.0"?>
 <!--
   Wrapper that pulls in the upstream TurtleBot3 Manipulation URDF unchanged
-  and bolts a Gazebo vacuum-gripper plugin onto end_effector_link.
+  and bolts a Gazebo vacuum-gripper plugin onto the model.
 
   Why: Gazebo Classic's finger-contact physics doesn't reliably hold small
   objects between the OpenManipulator-X gripper pads — they squirt out the
   moment the fingers close. The vacuum plugin sidesteps that by creating a
-  fixed joint to anything within max_distance of the link when the suction
-  is switched on. We toggle it via /vacuum_gripper/switch (std_srvs/SetBool)
-  from agent_node's pick_up() right after the gripper closes.
+  fixed joint to anything within max_distance of end_effector_link when the
+  suction is switched on. We toggle it via /vacuum_gripper/switch
+  (std_srvs/SetBool) from agent_node's pick_up() right after the gripper
+  closes.
 
-  All upstream xacro args are forwarded so this stays drop-in compatible.
+  Two non-obvious details:
+
+  1. The <gazebo> block is model-level (no reference=). gazebo_ros_vacuum_gripper
+     is a MODEL plugin, not a LINK plugin. Wrapping it in
+     <gazebo reference="end_effector_link"> made Gazebo try to load it as a
+     link plugin, which crashed gzserver during model load — that took out the
+     GUI (stuck on splash) AND blocked controller_manager from coming up.
+     The plugin's own <link_name>end_effector_link</link_name> tells it which
+     link to apply suction from.
+
+  2. We DO re-declare the upstream xacro args here, but with the SAME defaults
+     as upstream (use_sim=false, etc.). CLI args from arm_test.launch.py still
+     override them. The earlier fear of "shadowing CLI values" only matters
+     when the defaults differ from upstream's.
 -->
 <robot name="turtlebot3_manipulation_system" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- All xacro args (prefix, use_sim, use_fake_hardware, fake_sensor_commands)
-       are declared inside the upstream xacro. We deliberately don't re-declare
-       them here — redeclaration with defaults can shadow the CLI values that
-       arm_test.launch.py passes, which in turn gates out the gazebo_ros2_control
-       plugin block (its <xacro:if value="$(arg use_sim)">). That broke
-       /controller_manager in our first attempt. -->
+  <xacro:arg name="prefix"               default=""/>
+  <xacro:arg name="use_sim"              default="false"/>
+  <xacro:arg name="use_fake_hardware"    default="false"/>
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+
   <xacro:include filename="$(find turtlebot3_manipulation_description)/urdf/turtlebot3_manipulation.urdf.xacro"/>
 
-  <gazebo reference="end_effector_link">
+  <gazebo>
     <plugin name="vacuum_gripper" filename="libgazebo_ros_vacuum_gripper.so">
       <ros>
         <remapping>grasping:=vacuum_gripper/grasping</remapping>
