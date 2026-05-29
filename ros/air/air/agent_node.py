@@ -338,7 +338,13 @@ class AgentNode(Node):
         self._set_entity_state_client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
         self._fake_attach_target: Optional[str] = None
         self._fake_attach_timer = None
-        self._fake_attach_ee = "turtlebot3_manipulation_system::end_effector_link"
+        # NOT end_effector_link / gripper_link — Gazebo collapses URDF links
+        # that are children of fixed joints into their parent, so only link5
+        # (the last revolute-joint link, the wrist) is queryable via
+        # gazebo_ros_state. link5's origin sits a few cm behind the gripper
+        # tip; close enough for the visual fake-attach. If we ever need the
+        # exact tip we'd add a static offset here.
+        self._fake_attach_ee = "turtlebot3_manipulation_system::link5"
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
