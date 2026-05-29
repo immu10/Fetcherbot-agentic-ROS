@@ -182,6 +182,16 @@ class AgentNode(Node):
         self.declare_parameter("arm_dur_grasp",     4.0)
         self.declare_parameter("arm_dur_lift",      6.0)
 
+        # Label → Gazebo entity-name map for fake-attach. YOLO emits labels
+        # like "bottle" or "cup"; Gazebo wants the entity name the object was
+        # spawned with ("test_obj", "coke_can_1", etc.). Two parallel string
+        # arrays because ROS 2 params don't take dicts. Empty by default —
+        # arm_test populates with {"test_object": "test_obj"}; the full
+        # launch populates from whatever it spawns. Missing-label fallback
+        # in pick_up: use the label itself as the entity name.
+        self.declare_parameter("fake_attach_labels",   [""])
+        self.declare_parameter("fake_attach_entities", [""])
+
         # Named checkpoints from gazebo.launch.py via the AIR_CHECKPOINTS env
         # var (JSON: {"name": [x, y], ...}). Single source of truth — that
         # launch file also spawns the visible markers. Empty if unset, in which
@@ -359,6 +369,20 @@ class AgentNode(Node):
         # (which is what link5's origin is roughly level with). World-frame
         # because "down" is gravity-down regardless of wrist orientation.
         self._fake_attach_offset_world = np.array([0.0, 0.0, -0.05])
+        # While fake-attach is active we also pin the BOT base to its starting
+        # pose every tick. Without this, the TB3 wheels have so little static
+        # friction in Gazebo that the tiny constant reaction torque from
+        # holding the arm extended makes the base drift backward and ramp up.
+        # Captured lazily on the first successful link5 read (see
+        # _fake_attach_apply); cleared on _stop_fake_attach.
+        self._fake_attach_bot_model = "turtlebot3_manipulation_system"
+        self._fake_attach_bot_pose = None  # filled on first tick after pin start
+        # Bot-pin is independent of can fake-attach. Lifecycle:
+        #   - True from _start_bot_pin() until _stop_bot_pin() — only spans
+        #     the arm-lift segment of pick_up where reaction torque is large.
+        #   - Can fake-attach keeps running after the pin stops so the can
+        #     rides link5 as the bot drives away under Nav2 control.
+        self._bot_pin_active = False
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
@@ -1030,12 +1054,21 @@ class AgentNode(Node):
             # teleports the can every tick, that collision explodes into
             # Gazebo's solver and either flings the can or wedges it into the
             # base. Open fingers + can floating in the gap = clean visual.
-            # Start the teleport loop BEFORE the lift, so by the time the arm
-            # starts rising the can is already being snapped to the tip each
-            # tick. Hardcoded entity name for now — arm_test spawns "test_obj";
-            # full launch will need a label→entity map when more objects exist.
-            self._start_fake_attach("test_obj")
+            # ----- GAZEBO-SPECIFIC (fake-attach + bot-pin) -----------------
+            # The next four lines are tied to the gazebo_ros_state plugin
+            # and won't carry over verbatim to a non-Gazebo sim (Unity/
+            # Unreal). Behavior contract worth preserving across sims:
+            #   1. Resolve label→entity name via params.
+            #   2. Begin gluing the entity to the gripper before the lift.
+            #   3. Hold the base still during the lift (high arm torque).
+            #   4. Release the base after the lift; entity keeps riding the
+            #      gripper so the bot can drive away with it.
+            entity = self._resolve_attach_entity(object_label)
+            self._start_fake_attach(entity)
+            self._start_bot_pin()
             self._send_arm_pose(pose_lift, duration_s=dur_lift)
+            self._stop_bot_pin()
+            # --------------------------------------------------------------
         except Exception as e:
             return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
 
@@ -1148,10 +1181,46 @@ class AgentNode(Node):
     def _stop_fake_attach(self) -> None:
         """Stop the teleport loop. Object drops wherever it was last placed."""
         self._fake_attach_target = None
+        self._fake_attach_bot_pose = None
+        self._bot_pin_active = False
         if self._fake_attach_timer is not None:
             self._fake_attach_timer.cancel()
             self._fake_attach_timer = None
         self.get_logger().info("fake-attach: released")
+
+    def _resolve_attach_entity(self, label: str) -> str:
+        """Map a high-level object label (what pick_up was asked to grab) to
+        the entity name Gazebo registered when the object was spawned. Params
+        carry two parallel string arrays: fake_attach_labels[i] →
+        fake_attach_entities[i]. Missing/empty map ⇒ fall back to the label
+        itself. Defensive: any length mismatch logs and falls back."""
+        labels   = list(self.get_parameter("fake_attach_labels").value or [])
+        entities = list(self.get_parameter("fake_attach_entities").value or [])
+        # Strip the placeholder empty-string defaults declared in __init__.
+        pairs = [(l, e) for l, e in zip(labels, entities) if l and e]
+        if len(labels) != len(entities):
+            self.get_logger().warn(
+                f"fake_attach: labels/entities length mismatch "
+                f"({len(labels)} vs {len(entities)}); falling back to label"
+            )
+            return label
+        for l, e in pairs:
+            if l == label:
+                return e
+        return label  # fallback: assume label IS the entity name
+
+    def _start_bot_pin(self) -> None:
+        """Pin the bot's base to its current pose every fake-attach tick.
+        Use only while the arm is doing something high-torque (the lift) —
+        otherwise it'll block Nav2 driving. Idempotent; clears its cached
+        pose so the next tick re-captures from the current bot position."""
+        self._fake_attach_bot_pose = None
+        self._bot_pin_active = True
+
+    def _stop_bot_pin(self) -> None:
+        """Release the bot pin. Can fake-attach keeps running independently."""
+        self._bot_pin_active = False
+        self._fake_attach_bot_pose = None
 
     def _fake_attach_tick(self) -> None:
         """Timer callback: fetch end-effector world pose, push to target object.
@@ -1234,6 +1303,44 @@ class AgentNode(Node):
         if not getattr(self, "_fake_attach_set_logged", False):
             self._fake_attach_set_logged = True
             set_fut.add_done_callback(self._fake_attach_set_done)
+        # Bot-pin: independent of can fake-attach. Only runs when
+        # _bot_pin_active is True (during the lift segment of pick_up).
+        # After lift, the pin releases so Nav2 can drive — but the can
+        # fake-attach keeps running so the can rides link5.
+        if self._bot_pin_active:
+            if self._fake_attach_bot_pose is None:
+                bot_req = GetEntityState.Request()
+                bot_req.name = self._fake_attach_bot_model
+                bot_req.reference_frame = "world"
+                bot_fut = self._get_entity_state_client.call_async(bot_req)
+                bot_fut.add_done_callback(self._fake_attach_capture_bot_pose)
+            else:
+                pin_req = SetEntityState.Request()
+                pin_req.state.name = self._fake_attach_bot_model
+                pin_req.state.pose = self._fake_attach_bot_pose
+                pin_req.state.reference_frame = "world"
+                # zero twist explicitly — same reason as the can: don't let
+                # accumulated velocity from physics integrate between snaps.
+                self._set_entity_state_client.call_async(pin_req)
+
+    def _fake_attach_capture_bot_pose(self, future) -> None:
+        try:
+            resp = future.result()
+        except Exception as e:
+            self.get_logger().warn(f"fake-attach: bot-pose capture failed: {e}")
+            return
+        if resp is None or not resp.success:
+            self.get_logger().warn(
+                f"fake-attach: bot-pose capture get success=False for "
+                f"'{self._fake_attach_bot_model}' — bot won't be pinned"
+            )
+            return
+        self._fake_attach_bot_pose = resp.state.pose
+        p = resp.state.pose.position
+        self.get_logger().info(
+            f"fake-attach: pinned bot '{self._fake_attach_bot_model}' at "
+            f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f})"
+        )
 
     def _fake_attach_set_done(self, future) -> None:
         try:

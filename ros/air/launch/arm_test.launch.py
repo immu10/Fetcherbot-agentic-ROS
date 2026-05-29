@@ -127,6 +127,11 @@ def generate_launch_description():
             "arm_dur_pre_grasp":  DUR_PRE_GRASP,
             "arm_dur_grasp":      DUR_GRASP,
             "arm_dur_lift":       DUR_LIFT,
+            # Label→entity map for fake-attach. scan_only fires
+            # pick_up("test_object") and we spawn the SDF as "test_obj".
+            # The full launch will extend these arrays.
+            "fake_attach_labels":   ["test_object"],
+            "fake_attach_entities": ["test_obj"],
         }],
     )
     delayed_agent = TimerAction(period=10.0, actions=[agent_node])

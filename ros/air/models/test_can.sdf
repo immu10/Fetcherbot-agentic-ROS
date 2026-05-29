@@ -11,6 +11,12 @@
 <sdf version="1.6">
   <model name="test_obj">
     <link name="link">
+      <!-- Gravity off because collide_bitmask=0x00 means the can passes
+           through the ground too. Without this it falls off the world
+           forever (before fake-attach starts and again on release). With
+           gravity off it just hovers at spawn until fake-attach pins it
+           to the wrist; on release it stays put wherever last placed. -->
+      <gravity>0</gravity>
       <inertial>
         <mass>0.39</mass>
         <inertia>
