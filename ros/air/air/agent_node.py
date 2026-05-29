@@ -990,7 +990,16 @@ class AgentNode(Node):
             self._send_gripper(g_open)
             self._send_arm_pose(pose_pre_grasp, duration_s=dur_pre_grasp)
             self._send_arm_pose(pose_grasp,     duration_s=dur_grasp)
-            self._send_gripper(g_closed)
+            # Slow close: GripperCommand has no duration arg, so we step from
+            # open → closed via small intermediate commands. Avoids the "snap
+            # shut and fling the object" behaviour you get from a single big
+            # position command at max motor speed.
+            steps = 10
+            close_total_s = 2.0   # total time to traverse open → closed
+            for i in range(1, steps + 1):
+                intermediate = g_open + (g_closed - g_open) * (i / steps)
+                self._send_gripper(intermediate)
+                time.sleep(close_total_s / steps)
             # Fingers are touching the object now — flip the suction ON before
             # we lift so Gazebo's vacuum plugin welds it to end_effector_link.
             self._set_vacuum(True)
