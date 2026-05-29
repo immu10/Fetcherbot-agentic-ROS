@@ -1002,7 +1002,7 @@ class AgentNode(Node):
             close_total_s = 20.0    # 1s per step
             check_after  = 18       # first check fires at tick 19
             check_lift_delta = -0.15  # joint2 delta ≈ ~2 cm up (smaller joint2 = higher arm)
-            check_dur    = 1.5      # seconds for the up move and the down move
+            check_dur    = 3.0      # seconds for the up move and the down move (slower = less wobble)
             for i in range(1, steps + 1):
                 intermediate = g_open + (g_closed - g_open) * (i / steps)
                 self._send_gripper(intermediate)

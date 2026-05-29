@@ -90,10 +90,11 @@ def generate_launch_description():
     # Delay enough that sim + controllers are up first; MoveIt needs them.
     delayed_move_group = TimerAction(period=9.0, actions=[move_group_launch])
 
-    # Test object ~30 cm in front of the bot. coke_can (cylinder) instead of
-    # cricket_ball (sphere) — Gazebo's contact solver doesn't blow up against
-    # flat-based objects.
-    obj = _spawn_db("test_obj", "coke_can", x=-1.75, y=-0.5, z=0.05)
+    # Test object ~25 cm in front of the bot. wood_cube_2_5cm (2.5 cm cube) —
+    # small enough that the gripper can actually close around it, unlike the
+    # coke_can which is wider than the max finger gap. If friction-grasp fails
+    # on this too, we pivot to fake-attach (teleport-to-gripper).
+    obj = _spawn_db("test_obj", "wood_cube_2_5cm", x=-1.75, y=-0.5, z=0.02)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
     # agent_node — launched directly (not via agent.launch.py) so we can pass
