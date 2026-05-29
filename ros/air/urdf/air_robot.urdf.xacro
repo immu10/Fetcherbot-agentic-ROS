@@ -14,11 +14,12 @@
 -->
 <robot name="turtlebot3_manipulation_system" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <xacro:arg name="prefix"               default=""/>
-  <xacro:arg name="use_sim"              default="true"/>
-  <xacro:arg name="use_fake_hardware"    default="false"/>
-  <xacro:arg name="fake_sensor_commands" default="false"/>
-
+  <!-- All xacro args (prefix, use_sim, use_fake_hardware, fake_sensor_commands)
+       are declared inside the upstream xacro. We deliberately don't re-declare
+       them here — redeclaration with defaults can shadow the CLI values that
+       arm_test.launch.py passes, which in turn gates out the gazebo_ros2_control
+       plugin block (its <xacro:if value="$(arg use_sim)">). That broke
+       /controller_manager in our first attempt. -->
   <xacro:include filename="$(find turtlebot3_manipulation_description)/urdf/turtlebot3_manipulation.urdf.xacro"/>
 
   <gazebo reference="end_effector_link">
