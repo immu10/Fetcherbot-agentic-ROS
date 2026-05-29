@@ -1401,15 +1401,20 @@ class AgentNode(Node):
         _air_log.info(f"scan-only loop started (period={period_s}s)")
 
         # One-shot arm-sweep test. Give the action servers a moment to come up.
-        time.sleep(2.0)
-        self.get_logger().info("scan-only: firing pick_up() once for arm test...")
-        try:
-            res = self.pick_up("test_object")
-            self.get_logger().info(f"scan-only: pick_up returned {res}")
-            _air_log.info(f"scan-only pick_up result: {res}")
-        except Exception as e:
-            self.get_logger().warn(f"scan-only: pick_up raised {type(e).__name__}: {e}")
-            _air_log.warning(f"scan-only pick_up exception: {e}")
+        # ====== KNOWN-GOOD PICKUP STATE (commented for YOLO smoke test) ======
+        # Uncomment to restore the auto-pick at startup. Currently disabled
+        # so the scan-only loop only prints YOLO detections — no pick_up log
+        # spam, no fake-attach messages, no arm motion clutter.
+        # time.sleep(2.0)
+        # self.get_logger().info("scan-only: firing pick_up() once for arm test...")
+        # try:
+        #     res = self.pick_up("test_object")
+        #     self.get_logger().info(f"scan-only: pick_up returned {res}")
+        #     _air_log.info(f"scan-only pick_up result: {res}")
+        # except Exception as e:
+        #     self.get_logger().warn(f"scan-only: pick_up raised {type(e).__name__}: {e}")
+        #     _air_log.warning(f"scan-only pick_up exception: {e}")
+        # =====================================================================
         while rclpy.ok():
             result = self.scan_scene()
             if "error" in result:
