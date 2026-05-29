@@ -39,7 +39,7 @@ POSE_GRASP     = [0.0,  1.1, -0.7,  0.2]   # gripper at object height, parallel
 POSE_LIFT      = [0.0,  0.4,  0.0,  0.0]   # raised, holding
 
 GRIPPER_OPEN   =  0.019    # max open
-GRIPPER_CLOSED =  0.0      # close on object (less aggressive than -0.01)
+GRIPPER_CLOSED =  0.010    # barely close — just touch, don't pinch (was 0.0)
 
 # Durations (seconds). Long because the arm is heavy relative to the mobile
 # base; fast moves apply reaction forces that flip the bot.

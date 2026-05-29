@@ -1038,7 +1038,9 @@ class AgentNode(Node):
         """Blocking send to the gripper. position: ~+0.019 open, ~-0.01 closed."""
         goal = GripperCommand.Goal()
         goal.command.position = float(position)
-        goal.command.max_effort = 2.0
+        # Low max_effort — high effort flings small objects out the moment
+        # fingers make contact. 0.5 is enough to hold but won't blast the can.
+        goal.command.max_effort = 0.5
 
         self.get_logger().info(f"gripper → {position}")
         send_fut = self._gripper_client.send_goal_async(goal)
