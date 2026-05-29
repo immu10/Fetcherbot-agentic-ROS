@@ -140,17 +140,11 @@ def generate_launch_description():
     # zone (~(-1.75, -0.5)) with the three objects spread sideways so the
     # camera sees all three at once.
     yolo_spawns = [
-        # YCB scanned-mesh objects (CentralLabFacilities/gazebo_ycb).
-        # Real textured meshes — YOLO/COCO classifies cleanly. Requires
-        # GAZEBO_MODEL_PATH to include ~/gazebo_ycb/models.
-        # z bumped from 0.05 → 0.25 so the bot's forward camera sees profiles
-        # instead of top-down silhouettes. A banana from above is just a
-        # curved line; YOLO needs the side view to classify it. Same fix
-        # helps the apple (gets "apple" instead of "sports ball") and the
-        # bowl (gets "bowl" instead of "frisbee").
-        _spawn_db("apple",   "apple",          x=-1.60, y=-0.30, z=0.25),
-        _spawn_db("mustard", "mustard_bottle", x=-1.60, y=-0.50, z=0.25),
-        _spawn_db("bowl",    "bowl",           x=-1.60, y=-0.70, z=0.25),
+        # Google Research photogrammetry-scanned teddy bear from Gazebo Fuel.
+        # Real-product texture → YOLO/COCO "teddy bear" is a reliable hit.
+        # Requires GAZEBO_MODEL_PATH to include ~/gazebo_models.
+        _spawn_db("teddy", "Lovable_Huggable_Cuddly_Boutique_Teddy_Bear_Beige",
+                  x=-1.60, y=-0.50, z=0.25),
     ]
     delayed_obj = TimerAction(period=8.0, actions=yolo_spawns)
 
