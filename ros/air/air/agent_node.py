@@ -995,7 +995,7 @@ class AgentNode(Node):
             # shut and fling the object" behaviour you get from a single big
             # position command at max motor speed.
             steps = 20
-            close_total_s = 5.0   # total time to traverse open → closed
+            close_total_s = 40.0   # 2s per step — countable so you can pinpoint where it fails
             for i in range(1, steps + 1):
                 intermediate = g_open + (g_closed - g_open) * (i / steps)
                 self._send_gripper(intermediate)
