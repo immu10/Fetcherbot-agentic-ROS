@@ -1137,7 +1137,12 @@ class AgentNode(Node):
         # start the timer; each tick self-skips if the services aren't ready.
         self._fake_attach_target = entity_name
         if self._fake_attach_timer is None:
-            self._fake_attach_timer = self.create_timer(1.0 / 30.0, self._fake_attach_tick)
+            # 100 Hz — at 30 Hz gravity visibly drops the can between snaps
+            # (the physics engine runs at 1000 Hz so each tick accumulates
+            # ~10 mm of fall before we yank it back). Higher rate = less
+            # visible bounce. Can push to 200 Hz if jitter persists, but
+            # async get/set chain probably becomes the bottleneck first.
+            self._fake_attach_timer = self.create_timer(1.0 / 100.0, self._fake_attach_tick)
         self.get_logger().info(f"fake-attach: glued '{entity_name}' to {self._fake_attach_ee}")
 
     def _stop_fake_attach(self) -> None:
@@ -1213,6 +1218,16 @@ class AgentNode(Node):
         set_req.state.pose.orientation.y = 0.0
         set_req.state.pose.orientation.z = 0.0
         set_req.state.pose.orientation.w = 1.0
+        # Explicitly zero the twist so the can can't accumulate velocity
+        # between our teleports — otherwise even with pose snapping, Gazebo
+        # integrates the velocity it had at the last physics step and the
+        # next step starts from a moving can. Zero twist = pure pose write.
+        set_req.state.twist.linear.x = 0.0
+        set_req.state.twist.linear.y = 0.0
+        set_req.state.twist.linear.z = 0.0
+        set_req.state.twist.angular.x = 0.0
+        set_req.state.twist.angular.y = 0.0
+        set_req.state.twist.angular.z = 0.0
         set_req.state.reference_frame = "world"
         set_fut = self._set_entity_state_client.call_async(set_req)
         # log the FIRST set response so we know if Gazebo accepted it
