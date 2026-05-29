@@ -47,6 +47,7 @@ from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from std_srvs.srv import SetBool
+from gazebo_msgs.srv import GetEntityState, SetEntityState
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from cv_bridge import CvBridge
@@ -324,6 +325,20 @@ class AgentNode(Node):
         # from pick_up() right after the fingers close — Gazebo's contact
         # solver can't reliably hold small objects between the pads otherwise.
         self._vacuum_client = self.create_client(SetBool, "/vacuum_gripper/switch")
+
+        # ---- fake-attach (teleport-to-gripper) -----------------------------
+        # Gazebo Classic's finger contact can't hold the can no matter how we
+        # tune the gripper. Instead we cheat: after pick_up's gripper closes,
+        # a timer reads end_effector_link's world pose via /gazebo/get_entity_state
+        # and pushes that pose to the picked object via /gazebo/set_entity_state
+        # ~30 times a second. Visually the can stays glued to the gripper tip
+        # through the lift and any subsequent base motion. Released by calling
+        # _stop_fake_attach() — not wired yet (no release tool in scope).
+        self._get_entity_state_client = self.create_client(GetEntityState, "/gazebo/get_entity_state")
+        self._set_entity_state_client = self.create_client(SetEntityState, "/gazebo/set_entity_state")
+        self._fake_attach_target: Optional[str] = None
+        self._fake_attach_timer = None
+        self._fake_attach_ee = "turtlebot3_manipulation_system::end_effector_link"
 
         # OpenManipulator-X has 4 arm joints (joint1..4); ros2_control exposes
         # them under these names. Update if your URDF differs.
@@ -990,32 +1005,14 @@ class AgentNode(Node):
             self._send_gripper(g_open)
             self._send_arm_pose(pose_pre_grasp, duration_s=dur_pre_grasp)
             self._send_arm_pose(pose_grasp,     duration_s=dur_grasp)
-            # Slow close: GripperCommand has no duration arg, so we step from
-            # open → closed via small intermediate commands. Avoids the "snap
-            # shut and fling the object" behaviour you get from a single big
-            # position command at max motor speed.
-            #
-            # After CHECK_AFTER ticks, each subsequent tick also does a tiny
-            # lift-and-lower as a visual "is it still gripped?" probe — if the
-            # can falls there, you know that pinch level wasn't firm enough.
-            steps        = 20
-            close_total_s = 20.0    # 1s per step
-            check_after  = 18       # first check fires at tick 19
-            check_lift_delta = -0.15  # joint2 delta ≈ ~2 cm up (smaller joint2 = higher arm)
-            check_dur    = 3.0      # seconds for the up move and the down move (slower = less wobble)
-            for i in range(1, steps + 1):
-                intermediate = g_open + (g_closed - g_open) * (i / steps)
-                self._send_gripper(intermediate)
-                time.sleep(close_total_s / steps)
-                if i > check_after:
-                    lifted = list(pose_grasp)
-                    lifted[1] += check_lift_delta
-                    self._send_arm_pose(lifted,     duration_s=check_dur)
-                    self._send_arm_pose(pose_grasp, duration_s=check_dur)
-            # Fingers are touching the object now — flip the suction ON before
-            # we lift so Gazebo's vacuum plugin welds it to end_effector_link.
-            self._set_vacuum(True)
-            self._send_arm_pose(pose_lift,      duration_s=dur_lift)
+            # Cosmetic close — the actual hold comes from fake-attach below.
+            self._send_gripper(g_closed)
+            # Start the teleport loop BEFORE the lift, so by the time the arm
+            # starts rising the can is already being snapped to the tip each
+            # tick. Hardcoded entity name for now — arm_test spawns "test_obj";
+            # full launch will need a label→entity map when more objects exist.
+            self._start_fake_attach("test_obj")
+            self._send_arm_pose(pose_lift, duration_s=dur_lift)
         except Exception as e:
             return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
 
@@ -1104,6 +1101,61 @@ class AgentNode(Node):
             time.sleep(0.05)
         if not fut.done():
             self.get_logger().warn("vacuum: switch service call timed out")
+
+    # ------------------------------------------------------------------
+    # Fake-attach (teleport-to-gripper)
+    # ------------------------------------------------------------------
+    def _start_fake_attach(self, entity_name: str) -> None:
+        """Begin teleporting `entity_name` to end_effector_link's world pose at
+        ~30 Hz. Idempotent — calling twice replaces the prior target.
+        """
+        if not self._set_entity_state_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("fake-attach: /gazebo/set_entity_state unavailable; skipping")
+            return
+        if not self._get_entity_state_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("fake-attach: /gazebo/get_entity_state unavailable; skipping")
+            return
+        self._fake_attach_target = entity_name
+        if self._fake_attach_timer is None:
+            self._fake_attach_timer = self.create_timer(1.0 / 30.0, self._fake_attach_tick)
+        self.get_logger().info(f"fake-attach: glued '{entity_name}' to {self._fake_attach_ee}")
+
+    def _stop_fake_attach(self) -> None:
+        """Stop the teleport loop. Object drops wherever it was last placed."""
+        self._fake_attach_target = None
+        if self._fake_attach_timer is not None:
+            self._fake_attach_timer.cancel()
+            self._fake_attach_timer = None
+        self.get_logger().info("fake-attach: released")
+
+    def _fake_attach_tick(self) -> None:
+        """Timer callback: fetch end-effector world pose, push to target object.
+        Both calls are async with done callbacks — never blocks the timer."""
+        target = self._fake_attach_target
+        if not target:
+            return
+        req = GetEntityState.Request()
+        req.name = self._fake_attach_ee
+        req.reference_frame = "world"
+        fut = self._get_entity_state_client.call_async(req)
+        fut.add_done_callback(self._fake_attach_apply)
+
+    def _fake_attach_apply(self, future) -> None:
+        target = self._fake_attach_target
+        if not target:
+            return
+        try:
+            resp = future.result()
+        except Exception as e:
+            self.get_logger().warn(f"fake-attach get failed: {e}")
+            return
+        if resp is None or not resp.success:
+            return
+        set_req = SetEntityState.Request()
+        set_req.state.name = target
+        set_req.state.pose = resp.state.pose
+        set_req.state.reference_frame = "world"
+        self._set_entity_state_client.call_async(set_req)
 
     def ask_user(self, question: str) -> dict:
         """Publish a question, block until /agent/user comes back (or timeout).
