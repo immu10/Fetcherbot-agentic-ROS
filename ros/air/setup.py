@@ -20,6 +20,9 @@ setup(
         (f"share/{package_name}/worlds", [
             "worlds/arm_test.world",
         ]),
+        (f"share/{package_name}/models", [
+            "models/test_can.sdf",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

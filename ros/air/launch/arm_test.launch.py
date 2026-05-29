@@ -49,7 +49,7 @@ DUR_LIFT       = 6.0
 # ============================================================================
 
 
-def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
+def _spawn_file(name: str, sdf_path, x: float, y: float, z: float):
     return Node(
         package="gazebo_ros",
         executable="spawn_entity.py",
@@ -58,7 +58,7 @@ def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
         arguments=[
             "-entity", name,
             "-x", str(x), "-y", str(y), "-z", str(z),
-            "-database", db_model,
+            "-file", sdf_path,
         ],
     )
 
@@ -99,12 +99,15 @@ def generate_launch_description():
     # Delay enough that sim + controllers are up first; MoveIt needs them.
     delayed_move_group = TimerAction(period=9.0, actions=[move_group_launch])
 
-    # Test object ~25 cm in front of the bot. coke_can (cylinder) — Gazebo's
-    # contact solver doesn't blow up against flat-based objects. We don't rely
-    # on real grasping anymore: pick_up's gripper close is cosmetic, and the
-    # can sticks to end_effector_link via fake-attach (set_entity_state loop)
-    # for the lift.
-    obj = _spawn_db("test_obj", "coke_can", x=-1.75, y=-0.5, z=0.05)
+    # Test object ~25 cm in front of the bot. Custom SDF (not -database
+    # coke_can) because fake-attach pose-snaps the object every tick — with
+    # collisions enabled, the contact solver fights the snap and launches
+    # the bot. Our test_can.sdf is a coke-can-sized cylinder with collision
+    # bitmask 0x00 so it never registers contacts with anything.
+    test_can_sdf = PathJoinSubstitution([
+        FindPackageShare("air"), "models", "test_can.sdf",
+    ])
+    obj = _spawn_file("test_obj", test_can_sdf, x=-1.75, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
     # agent_node — launched directly (not via agent.launch.py) so we can pass
