@@ -1150,13 +1150,33 @@ class AgentNode(Node):
         except Exception as e:
             self.get_logger().warn(f"fake-attach get failed: {e}")
             return
-        if resp is None or not resp.success:
+        if resp is None:
+            self.get_logger().warn("fake-attach: get returned None")
             return
+        if not resp.success:
+            self.get_logger().warn("fake-attach: get success=False (bad link name?)")
+            return
+        # One-time log of the first successful read so we can confirm pose looks sane.
+        if not getattr(self, "_fake_attach_logged", False):
+            p = resp.state.pose.position
+            self.get_logger().info(f"fake-attach: ee pose = ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})")
+            self._fake_attach_logged = True
         set_req = SetEntityState.Request()
         set_req.state.name = target
         set_req.state.pose = resp.state.pose
         set_req.state.reference_frame = "world"
-        self._set_entity_state_client.call_async(set_req)
+        set_fut = self._set_entity_state_client.call_async(set_req)
+        # log the FIRST set response so we know if Gazebo accepted it
+        if not getattr(self, "_fake_attach_set_logged", False):
+            self._fake_attach_set_logged = True
+            set_fut.add_done_callback(self._fake_attach_set_done)
+
+    def _fake_attach_set_done(self, future) -> None:
+        try:
+            resp = future.result()
+            self.get_logger().info(f"fake-attach: first set response success={getattr(resp, 'success', '??')}")
+        except Exception as e:
+            self.get_logger().warn(f"fake-attach: first set failed: {e}")
 
     def ask_user(self, question: str) -> dict:
         """Publish a question, block until /agent/user comes back (or timeout).
