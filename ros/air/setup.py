@@ -24,6 +24,20 @@ setup(
             "models/test_can.sdf",
             "models/test_ball.sdf",
         ]),
+        # Teddy bear (Google Research Fuel download). Five files across
+        # three subdirs — Gazebo resolves meshes/* and materials/* relative
+        # to the SDF, so the directory layout must be preserved.
+        (f"share/{package_name}/models/teddy_bear", [
+            "models/teddy_bear/model.config",
+            "models/teddy_bear/model.sdf",
+        ]),
+        (f"share/{package_name}/models/teddy_bear/meshes", [
+            "models/teddy_bear/meshes/model.obj",
+            "models/teddy_bear/meshes/model.mtl",
+        ]),
+        (f"share/{package_name}/models/teddy_bear/materials/textures", [
+            "models/teddy_bear/materials/textures/texture.png",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
