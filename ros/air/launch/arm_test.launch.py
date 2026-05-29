@@ -63,6 +63,24 @@ def _spawn_file(name: str, sdf_path, x: float, y: float, z: float):
     )
 
 
+def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
+    """Spawn a Gazebo db model (coke_can, plastic_cup, cricket_ball, ...).
+    Brings full native collision + gravity — NOT compatible with fake-attach.
+    Used here only for YOLO-detection smoke tests before we wrap each model
+    into a ghost-collision SDF for actual pickup."""
+    return Node(
+        package="gazebo_ros",
+        executable="spawn_entity.py",
+        name=f"spawn_{name}",
+        output="screen",
+        arguments=[
+            "-entity", name,
+            "-x", str(x), "-y", str(y), "-z", str(z),
+            "-database", db_model,
+        ],
+    )
+
+
 def generate_launch_description():
     # Gazebo + bot + ros2_control (same as the full launch), BUT with our own
     # world file. Upstream's default (turtlebot3_world.world) doesn't load the
@@ -104,14 +122,29 @@ def generate_launch_description():
     # collisions enabled, the contact solver fights the snap and launches
     # the bot. Our test_can.sdf is a coke-can-sized cylinder with collision
     # bitmask 0x00 so it never registers contacts with anything.
-    # Swap test_can.sdf ↔ test_ball.sdf (or any future test_*.sdf) here to
-    # iterate on object types. Both share the same fake-attach contract:
-    # collision bitmask 0x00, gravity off, model name "test_obj".
-    test_obj_sdf = PathJoinSubstitution([
-        FindPackageShare("air"), "models", "test_ball.sdf",
-    ])
-    obj = _spawn_file("test_obj", test_obj_sdf, x=-1.75, y=-0.5, z=0.05)
-    delayed_obj = TimerAction(period=8.0, actions=[obj])
+    # ====== KNOWN-GOOD PICKUP STATE (commented for YOLO smoke test) ======
+    # Restore by uncommenting this block and commenting out the db-spawn
+    # block below. This is the working fake-attach pickup setup — one
+    # ghost-collision test object spawned at the canned-pose grab point.
+    # test_obj_sdf = PathJoinSubstitution([
+    #     FindPackageShare("air"), "models", "test_ball.sdf",
+    # ])
+    # obj = _spawn_file("test_obj", test_obj_sdf, x=-1.75, y=-0.5, z=0.05)
+    # delayed_obj = TimerAction(period=8.0, actions=[obj])
+    # =====================================================================
+
+    # YOLO smoke test: spawn the three db objects from gazebo.launch.py
+    # in front of the bot. NATIVE collision + gravity — pickup will NOT
+    # work cleanly on these (fake-attach fights physics); only here to
+    # verify YOLO classifies them. Coords approximate the arm-test grab
+    # zone (~(-1.75, -0.5)) with the three objects spread sideways so the
+    # camera sees all three at once.
+    yolo_spawns = [
+        _spawn_db("coke", "coke_can",     x=-1.60, y=-0.30, z=0.05),
+        _spawn_db("cup",  "plastic_cup",  x=-1.60, y=-0.50, z=0.05),
+        _spawn_db("ball", "cricket_ball", x=-1.60, y=-0.70, z=0.05),
+    ]
+    delayed_obj = TimerAction(period=8.0, actions=yolo_spawns)
 
     # agent_node — launched directly (not via agent.launch.py) so we can pass
     # the tuning overrides as parameters. With AIR_LLM_ENABLED=0 (forced
