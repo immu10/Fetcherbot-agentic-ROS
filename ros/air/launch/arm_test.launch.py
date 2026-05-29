@@ -93,7 +93,7 @@ def generate_launch_description():
     # Test object ~30 cm in front of the bot. coke_can (cylinder) instead of
     # cricket_ball (sphere) — Gazebo's contact solver doesn't blow up against
     # flat-based objects.
-    obj = _spawn_db("test_obj", "coke_can", x=-1.7, y=-0.5, z=0.05)
+    obj = _spawn_db("test_obj", "coke_can", x=-1.82, y=-0.5, z=0.05)
     delayed_obj = TimerAction(period=8.0, actions=[obj])
 
     # agent_node — launched directly (not via agent.launch.py) so we can pass
