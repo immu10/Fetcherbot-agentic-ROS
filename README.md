@@ -1,14 +1,9 @@
-
-
-https://github.com/user-attachments/assets/1b1189bd-b3a3-4d48-9806-7c11d51b1b40
-
-
-
-bleh
-
-
 # Robot Pipeline Flow
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
+
+## Demo
+
+https://github.com/user-attachments/assets/1b1189bd-b3a3-4d48-9806-7c11d51b1b40
 
 ---
 
@@ -227,3 +222,42 @@ Notable quirks fixed along the way:
 > **Simulation note:** Voice input can be replaced with a simple text publisher
 > during development — publish directly to `/speech/raw_command` to test the
 > full agent loop without needing a microphone setup.
+
+---
+
+## Limitations
+
+The main limitation in this sim came from Gazebo Classic itself, not the agent
+logic. Two compounding issues:
+
+- **Gripper contact physics is unreliable.** Gazebo's ODE solver couldn't
+  hold small objects (a coke can, a ball) between the OpenManipulator-X
+  fingers no matter how we tuned closing speed, finger friction, or contact
+  surface params. The object would either ping out at the speed of light
+  on first contact or slip through the pads as the arm lifted.
+- **No force/torque feedback on the gripper.** The TB3 manipulation URDF
+  doesn't expose a contact sensor on the fingertips, so we couldn't even
+  *detect* a successful grasp to close-loop on it.
+
+To work around both, the pickup routine is **cosmetic** — the canned arm
+trajectory runs visually, but the held object is glued to the wrist via a
+30 Hz pose-snap loop (`/gazebo/set_entity_state`), and the bot's base is
+pinned briefly during the lift to absorb arm reaction torque. The held
+object uses a `collide_bitmask=0x00` SDF so the contact solver ignores it
+entirely. None of this would carry over to real hardware — on a real arm,
+the existing `pick_up()` would need MoveIt2 IK + a real grasp closure
+detected from current/effort feedback. The agent loop, tool palette,
+phase machine, and Nav2 retry logic are all sim-independent.
+
+- **YOLO11 only reliably detects a ball in this sim.** Stock COCO weights
+  expect real-world photographs; Gazebo's render quality (low-poly meshes,
+  flat lighting) doesn't match well enough for confident classification on
+  most objects. We limited the demo to a single ball because that's what
+  YOLO would consistently catch. On real hardware, or with a YOLO model
+  fine-tuned on a Gazebo-quality dataset, the same agent loop scales to
+  the full object palette without code changes.
+- **Speech-to-text exists but isn't wired in.** The STT module is
+  implemented and standalone-testable, but for the demo we feed text
+  straight to `/agent/user` instead of routing through it. Wiring is a
+  pure plumbing change — publish STT output to the same topic — but
+  wasn't needed to demonstrate the agent loop, so we left it disconnected.
