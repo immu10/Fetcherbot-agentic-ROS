@@ -108,6 +108,12 @@ def _patched_world() -> str:
     fake-attach than a launch crash.
     """
     from ament_index_python.packages import get_package_share_directory
+    # 9-pillar hexagonal world lives in turtlebot3_gazebo, NOT
+    # turtlebot3_manipulation_gazebo (which has its own bare ground+sun
+    # variant under the same filename — confusing). The manipulation launch
+    # defaults to its bare variant, but we want the pillar map for Nav2 to
+    # have something to plan around, so we explicitly load from
+    # turtlebot3_gazebo here and pass `world:=` to override the default.
     src = os.path.join(
         get_package_share_directory("turtlebot3_gazebo"),
         "worlds", "turtlebot3_world.world",
