@@ -368,7 +368,7 @@ class AgentNode(Node):
         # open fingers instead of stacking on top of the gripper housing
         # (which is what link5's origin is roughly level with). World-frame
         # because "down" is gravity-down regardless of wrist orientation.
-        self._fake_attach_offset_world = np.array([0.0, 0.0, -0.05])
+        self._fake_attach_offset_world = np.array([0.0, 0.0, 0.0])
         # While fake-attach is active we also pin the BOT base to its starting
         # pose every tick. Without this, the TB3 wheels have so little static
         # friction in Gazebo that the tiny constant reaction torque from
