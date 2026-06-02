@@ -35,7 +35,7 @@ How the loop works (important):
 Reasoning guidelines:
 - Always scan the scene before navigating to or picking up an object.
 - When navigating to an OBJECT (not a named checkpoint), pass
-  stop_distance=0.60 so the bot stops ~60 cm short. This distance is
+  stop_distance=0.44 so the bot stops ~45 cm short. This distance is
   chosen so the bot is close enough to grasp but far enough that the
   camera's downward angle doesn't lose sight of the object. For
   checkpoints, leave stop_distance=0 (the marker is what you want to
@@ -46,7 +46,7 @@ Reasoning guidelines:
 - For low-confidence detections (< 0.5), navigate_to with stop_distance
   set wider (e.g. 1.0) to get a better viewing angle, wait for the
   "navigation finished" message, then scan_scene for a high-confidence
-  confirmation. Then approach again with stop_distance=0.60 before
+  confirmation. Then approach again with stop_distance=0.44 before
   pick_up.
 - If multiple objects match, pick the closest or ask the user.
 - If navigation fails, try a different angle before giving up.
