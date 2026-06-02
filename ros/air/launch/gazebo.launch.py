@@ -93,6 +93,46 @@ _MARKER_SDF = """<?xml version="1.0"?>
 """
 
 
+def _patched_world() -> str:
+    """Copy turtlebot3_world.world (the maze) to /tmp with the
+    gazebo_ros_state plugin injected just before </world>. Returns the
+    patched file's path.
+
+    Why patch instead of vendoring: same reasoning as _patched_nav2_params —
+    upstream maintains the world; we just need to add one plugin block so
+    fake-attach has /gazebo/get_entity_state and /gazebo/set_entity_state
+    available. Vendoring would mean drift on upstream updates.
+
+    Falls back to the unpatched upstream world (returns its path) if the
+    patcher can't find </world> — better an obstacle-rich world without
+    fake-attach than a launch crash.
+    """
+    from ament_index_python.packages import get_package_share_directory
+    src = os.path.join(
+        get_package_share_directory("turtlebot3_gazebo"),
+        "worlds", "turtlebot3_world.world",
+    )
+    with open(src, "r") as f:
+        text = f.read()
+
+    plugin_block = (
+        '    <plugin name="gazebo_ros_state" '
+        'filename="libgazebo_ros_state.so">\n'
+        '      <ros><namespace>/gazebo</namespace></ros>\n'
+        '      <update_rate>30.0</update_rate>\n'
+        '    </plugin>\n'
+        '  </world>'
+    )
+    if "</world>" not in text:
+        return src  # nothing we can patch; let upstream load as-is
+    patched = text.replace("</world>", plugin_block, 1)
+
+    out = os.path.join(tempfile.gettempdir(), "air_gazebo_world.world")
+    with open(out, "w") as f:
+        f.write(patched)
+    return out
+
+
 def _patched_nav2_params() -> str:
     """Copy nav2_bringup's nav2_params.yaml to /tmp with `allow_unknown: true`
     flipped on for the global planner. Returns the patched file's path.
@@ -197,23 +237,17 @@ def generate_launch_description():
     do_spawn  = LaunchConfiguration("spawn_objects")
 
     # 1) Gazebo + the robot + MoveIt2 (all from the upstream launch). We pass
-    #    `world:=…/arm_test.world` so the gazebo_ros_state plugin is loaded —
-    #    fake-attach needs /gazebo/get_entity_state + /gazebo/set_entity_state
-    #    to exist, and the upstream default world (turtlebot3_world.world)
-    #    doesn't include that plugin. Trade-off: arm_test.world is bare ground
-    #    + sun, so Nav2 has no obstacles to map. If you want obstacles back,
-    #    copy turtlebot3_world.world to ros/air/worlds/ and inject the plugin
-    #    the same way arm_test.world does.
-    arm_test_world = PathJoinSubstitution([
-        FindPackageShare("air"), "worlds", "arm_test.world",
-    ])
+    #    the patched upstream maze world (turtlebot3_world.world with the
+    #    gazebo_ros_state plugin injected) so fake-attach has its services
+    #    AND Nav2 has obstacles to map. See _patched_world() above.
+    patched_world = _patched_world()
     sim_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare(TB3_SIM_PACKAGE), "launch", TB3_SIM_LAUNCH,
             ])
         ),
-        launch_arguments={"world": arm_test_world}.items(),
+        launch_arguments={"world": patched_world}.items(),
     )
 
     # 2) Test objects in front of the robot (origin = robot center, +X = forward).
