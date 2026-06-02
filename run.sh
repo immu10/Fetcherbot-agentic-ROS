@@ -12,6 +12,21 @@
 
 set -e
 
+# Guaranteed teardown on Ctrl+C / kill / normal exit. Without this, gzserver/
+# gzclient and a few other ROS procs sometimes survive the launch tree's
+# shutdown and lock ports until the next reboot. trap fires before the shell
+# exits, so we get one polite pkill round and then an escalated -9 round.
+cleanup() {
+    echo
+    echo "[run.sh] shutting down sim..."
+    pkill -f gzserver  2>/dev/null
+    pkill -f gzclient  2>/dev/null
+    sleep 1
+    pkill -9 -f gzserver 2>/dev/null
+    pkill -9 -f gzclient 2>/dev/null
+}
+trap cleanup INT TERM EXIT
+
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 WS_ROOT="$REPO_ROOT/ros"
 
