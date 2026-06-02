@@ -196,16 +196,24 @@ def _spawn_db(name: str, db_model: str, x: float, y: float, z: float):
 def generate_launch_description():
     do_spawn  = LaunchConfiguration("spawn_objects")
 
-    # 1) Gazebo + the robot + MoveIt2 (all from the upstream launch).
-    #    No launch_arguments forwarded: moveit_gazebo.launch.py doesn't declare
-    #    `world` or `headless`, and forwarding undeclared args is a hard error.
-    #    Add args here only after confirming the upstream launch declares them.
+    # 1) Gazebo + the robot + MoveIt2 (all from the upstream launch). We pass
+    #    `world:=…/arm_test.world` so the gazebo_ros_state plugin is loaded —
+    #    fake-attach needs /gazebo/get_entity_state + /gazebo/set_entity_state
+    #    to exist, and the upstream default world (turtlebot3_world.world)
+    #    doesn't include that plugin. Trade-off: arm_test.world is bare ground
+    #    + sun, so Nav2 has no obstacles to map. If you want obstacles back,
+    #    copy turtlebot3_world.world to ros/air/worlds/ and inject the plugin
+    #    the same way arm_test.world does.
+    arm_test_world = PathJoinSubstitution([
+        FindPackageShare("air"), "worlds", "arm_test.world",
+    ])
     sim_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare(TB3_SIM_PACKAGE), "launch", TB3_SIM_LAUNCH,
             ])
         ),
+        launch_arguments={"world": arm_test_world}.items(),
     )
 
     # 2) Test objects in front of the robot (origin = robot center, +X = forward).
@@ -219,13 +227,30 @@ def generate_launch_description():
     #    All three cache under ~/.gazebo/models/ after first fetch. If Gazebo
     #    can't reach its database, swap to local SDFs (see git history) or use
     #    Ignition Fuel `<include><uri>https://fuel...</uri></include>`.
+    # Pickup target: ghost-collision test_ball.sdf at arm_test's known-good
+    # grab coordinates. Same SDF arm_test uses (collide_bitmask 0x00 + gravity
+    # off) so fake-attach works the same way here — bot can't be flung by the
+    # contact solver, ball doesn't fall through the floor. Spawn name is
+    # "test_obj" to match the label→entity map below.
+    test_ball_sdf = PathJoinSubstitution([
+        FindPackageShare("air"), "models", "test_ball.sdf",
+    ])
     spawns = [
-        # Cup + coke disabled while debugging ball-only nav. Their costmap
-        # inflation halos overlap the ball's approach zone, making stop_distance
-        # navigation fail. Re-enable once spawn coords are spread out.
+        Node(
+            package="gazebo_ros",
+            executable="spawn_entity.py",
+            name="spawn_test_obj",
+            output="screen",
+            arguments=[
+                "-entity", "test_obj",
+                "-x", "-0.45", "-y", "-0.45", "-z", "0.05",
+                "-file", test_ball_sdf,
+            ],
+        ),
+        # Cricket_ball and other db spawns kept commented for reference.
+        # _spawn_db("ball",  "cricket_ball", x=-0.45, y=-0.45, z=0.05),
         # _spawn_db("coke",  "coke_can",     x=0.45, y=-0.15,  z=0.05),
         # _spawn_db("cup",   "plastic_cup",  x=0.45, y=-0.30,  z=0.05),
-        _spawn_db("ball",  "cricket_ball", x=-0.45, y=-0.45, z=0.05),
     ]
 
     # Gazebo + ros2_control + URDF parsing takes a few seconds. Spawning objects
