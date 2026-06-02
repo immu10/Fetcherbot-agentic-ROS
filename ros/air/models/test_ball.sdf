@@ -1,0 +1,46 @@
+<?xml version="1.0" ?>
+<!--
+  Test object for gazebo.launch.py + arm_test pickup demo: a ball with the
+  same fake-attach contract as test_can.sdf — gravity off + collide_bitmask
+  0x00 so the pose-snap loop can teleport it through the bot without the
+  contact solver retaliating, and so it doesn't fall through the (also
+  non-colliding-with-it) ground when fake-attach isn't active.
+
+  4 cm radius, bright green. Not detected by YOLO (no texture, smooth
+  sphere) — the label→entity map in agent.launch.py maps pick_up labels
+  like "ball" / "sports ball" / "test_object" to this entity directly.
+-->
+<sdf version="1.6">
+  <model name="test_obj">
+    <link name="link">
+      <gravity>0</gravity>
+      <inertial>
+        <mass>0.15</mass>
+        <inertia>
+          <ixx>0.0001</ixx><iyy>0.0001</iyy><izz>0.0001</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <sphere><radius>0.04</radius></sphere>
+        </geometry>
+        <surface>
+          <contact>
+            <collide_bitmask>0x00</collide_bitmask>
+          </contact>
+        </surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <sphere><radius>0.04</radius></sphere>
+        </geometry>
+        <material>
+          <ambient>0.1 0.7 0.1 1</ambient>
+          <diffuse>0.15 0.85 0.15 1</diffuse>
+          <specular>0.3 0.3 0.3 1</specular>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
