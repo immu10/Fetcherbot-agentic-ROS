@@ -2,7 +2,7 @@
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
 
 ## Demo
-yt https://youtu.be/es9Xj_Tjwdc
+yt https://youtu.be/pmbQZr9Oym0
 
 
 https://github.com/user-attachments/assets/1b1189bd-b3a3-4d48-9806-7c11d51b1b40
