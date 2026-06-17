@@ -1,3 +1,5 @@
+This was a college course project (AI for Robotics). 
+
 # Fetcherbot Agentic ROS
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
 
