@@ -261,3 +261,9 @@ phase machine, and Nav2 retry logic are all sim-independent.
   straight to `/agent/user` instead of routing through it. Wiring is a
   pure plumbing change — publish STT output to the same topic — but
   wasn't needed to demonstrate the agent loop, so we left it disconnected.
+
+---
+
+## Tags
+
+ROS · Gazebo · Agentic · TB3
