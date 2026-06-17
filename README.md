@@ -1,4 +1,4 @@
-# Robot Pipeline Flow
+# Fetcherbot Agentic ROS
 ### Speech-Controlled Mobile Manipulator | ROS2 + Gazebo + YOLO + LLM Agent
 
 ## Demo
